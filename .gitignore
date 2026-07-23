@@ -1,0 +1,62 @@
+# Plan / local notes
+plan.md
+
+# Local config
+config.yaml
+config.yml
+.env
+.env.*
+
+# Runtime data
+data/
+
+# Logs
+*.log
+logs/
+
+# Cache
+.cache/
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp
+.tmp/
+tmp/
+*.tmp
+*.temp
+*~
+
+# Build artifacts
+dist/
+build/
+*.o
+*.a
+*.so
+*.dll
+*.exe
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-project
+*.sublime-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Secrets / keys
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+id_rsa
+id_rsa.pub
+*.secret
+secrets/
+credentials.*
