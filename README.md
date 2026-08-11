@@ -312,6 +312,9 @@ http://IP:2096/sub/token/mihomo
 - 状态页：脚本版本、最新状态、UFW 状态、缺失端口、系统、内核、架构、虚拟化、BBR、IP、地区、服务状态
 - 协议管理：Mixed、VLESS Reality、VMess WS、Hysteria2、TUIC v5、AnyTLS、Trojan、Shadowsocks、VMess TCP、VMess HTTP
 - 一键添加协议：一次生成 Mixed / VLESS Reality / VMess WS / Hysteria2 / TUIC v5 / AnyTLS
+- 添加协议时自动检测公网 IPv4/IPv6：单栈自动使用可用地址，双栈由用户选择节点地址类型
+- 一键添加协议在双栈 VPS 上只询问一次 IP 类型，并应用到本次新建的全部默认协议
+- 每个协议独立保存节点 IP 类型，可在修改协议菜单中切换；只影响客户端连接 VPS 的节点地址，不限制 VPS 的 Direct 出站
 - 手动添加协议额外支持 Trojan、Shadowsocks、VMess TCP、VMess HTTP；一键添加协议保持精简默认组合
 - 添加、更改、删除协议后会立即检查配置并应用运行态；删除所有协议会停止 sing-box
 - 查看协议时只读取并显示节点信息，不会重建配置或改动防火墙
@@ -326,7 +329,7 @@ http://IP:2096/sub/token/mihomo
 - 自动检测 TCP/UDP 端口占用，避免配置端口重复
 - 综合订阅支持修改端口、指定 token、回车随机重生成 token、设置或删除 HTTPS 订阅域名
 - HTTPS 订阅域名使用 Nginx + acme.sh 自动申请和续期证书；HTTP/IP 订阅同时保留
-- IPv6-only VPS 会自动使用 `[IPv6]` 形式生成订阅和节点 URI
+- IPv6-only VPS 的节点会自动使用 `[IPv6]` 形式生成 URI；双栈 VPS 可按协议选择 IPv4 或 IPv6
 - UFW active 时，安装、添加、更改协议后自动按 TCP/UDP 放行对应端口和订阅端口
 - UFW active 时，会维护脚本托管规则，端口变更后自动删除旧规则并放行新规则
 - UFW active 时，删除协议会同步删除对应放行规则

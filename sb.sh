@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -152,6 +152,18 @@ valid_domain() {
 
 valid_token() {
   [[ "$1" =~ ^[A-Za-z0-9]+$ ]]
+}
+
+valid_ip_address() {
+  local address="$1" version="$2"
+  python3 - "$address" "$version" <<'PY' >/dev/null 2>&1
+import ipaddress, sys
+try:
+  address = ipaddress.ip_address(sys.argv[1])
+except ValueError:
+  raise SystemExit(1)
+raise SystemExit(0 if address.version == int(sys.argv[2]) else 1)
+PY
 }
 
 ensure_dirs() {
@@ -1142,11 +1154,114 @@ rebuild_configs() {
 }
 
 public_ipv4() {
-  curl -4fs --max-time 5 https://api.ipify.org 2>/dev/null || true
+  local ip
+  ip="$(curl -4fs --max-time 5 https://api.ipify.org 2>/dev/null || true)"
+  valid_ip_address "$ip" 4 && printf '%s' "$ip" || true
 }
 
 public_ipv6() {
-  curl -6fs --max-time 5 https://api64.ipify.org 2>/dev/null || true
+  local ip
+  ip="$(curl -6fs --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
+  valid_ip_address "$ip" 6 && printf '%s' "$ip" || true
+}
+
+PUBLIC_IPS_DETECTED=false
+PUBLIC_IPS_CHECKED=0
+DETECTED_PUBLIC_IPV4=""
+DETECTED_PUBLIC_IPV6=""
+SELECTED_IP_VERSION=""
+PROTOCOL_HOST=""
+PROTOCOL_URL_HOST=""
+
+detect_public_ips() {
+  local force="${1:-false}" now
+  now="$(date +%s)"
+  if [[ "$force" != "true" && "$PUBLIC_IPS_DETECTED" == "true" && "$PUBLIC_IPS_CHECKED" =~ ^[0-9]+$ ]] && (( now - PUBLIC_IPS_CHECKED <= 30 )); then
+    [[ -n "$DETECTED_PUBLIC_IPV4" || -n "$DETECTED_PUBLIC_IPV6" ]]
+    return
+  fi
+  DETECTED_PUBLIC_IPV4="$(public_ipv4)"
+  DETECTED_PUBLIC_IPV6="$(public_ipv6)"
+  PUBLIC_IPS_DETECTED=true
+  PUBLIC_IPS_CHECKED="$now"
+  [[ -n "$DETECTED_PUBLIC_IPV4" || -n "$DETECTED_PUBLIC_IPV6" ]]
+}
+
+choose_node_ip_version() {
+  local label="$1" choice
+  SELECTED_IP_VERSION=""
+  if ! detect_public_ips true; then
+    fail "未检测到可用的公网 IPv4 或 IPv6，无法生成节点地址。" >&2
+    return 1
+  fi
+  if [[ -n "$DETECTED_PUBLIC_IPV4" && -n "$DETECTED_PUBLIC_IPV6" ]]; then
+    printf "请选择 %s 节点 IP 类型：\n1. IPv4  %s\n2. IPv6  %s\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
+    while true; do
+      safe_read "请选择 [1-2]: " choice
+      case "$choice" in
+        1) SELECTED_IP_VERSION=ipv4; return 0 ;;
+        2) SELECTED_IP_VERSION=ipv6; return 0 ;;
+        *) warn "请输入 1-2 的数字。" >&2 ;;
+      esac
+    done
+  elif [[ -n "$DETECTED_PUBLIC_IPV4" ]]; then
+    SELECTED_IP_VERSION=ipv4
+    info "$label 自动使用 IPv4：$DETECTED_PUBLIC_IPV4" >&2
+  else
+    SELECTED_IP_VERSION=ipv6
+    info "$label 自动使用 IPv6：$DETECTED_PUBLIC_IPV6" >&2
+  fi
+}
+
+select_protocol_hosts() {
+  local proto="$1" version
+  detect_public_ips || {
+    fail "未检测到可用的公网 IPv4 或 IPv6，无法生成节点地址。" >&2
+    return 1
+  }
+  version="$(proto_value "$proto" ip_version auto)"
+  case "$version" in
+    ipv4)
+      [[ -n "$DETECTED_PUBLIC_IPV4" ]] || {
+        fail "$proto 已选择 IPv4，但当前未检测到公网 IPv4。" >&2
+        return 1
+      }
+      PROTOCOL_HOST="$DETECTED_PUBLIC_IPV4"
+      ;;
+    ipv6)
+      [[ -n "$DETECTED_PUBLIC_IPV6" ]] || {
+        fail "$proto 已选择 IPv6，但当前未检测到公网 IPv6。" >&2
+        return 1
+      }
+      PROTOCOL_HOST="$DETECTED_PUBLIC_IPV6"
+      ;;
+    *)
+      PROTOCOL_HOST="${DETECTED_PUBLIC_IPV4:-$DETECTED_PUBLIC_IPV6}"
+      ;;
+  esac
+  if [[ "$PROTOCOL_HOST" == *:* ]]; then
+    PROTOCOL_URL_HOST="[$PROTOCOL_HOST]"
+  else
+    PROTOCOL_URL_HOST="$PROTOCOL_HOST"
+  fi
+}
+
+validate_protocol_hosts() {
+  local proto
+  for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http; do
+    if protocol_exists "$proto"; then
+      select_protocol_hosts "$proto" || return 1
+    fi
+  done
+  return 0
+}
+
+proto_ip_label() {
+  case "$(proto_value "$1" ip_version auto)" in
+    ipv4) printf 'IPv4' ;;
+    ipv6) printf 'IPv6' ;;
+    *) printf '自动' ;;
+  esac
 }
 
 server_host() {
@@ -1193,10 +1308,11 @@ show_subscription_links() {
 
 protocol_link_rows() {
   local host url_host
-  host="$(server_host)"
-  url_host="$(server_url_host)"
   if [[ "$(proto_value vless_reality enabled false)" == "true" ]]; then
     local port uuid sni public_key short_id
+    select_protocol_hosts vless_reality || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     port="$(proto_value vless_reality port)"
     uuid="$(proto_value vless_reality uuid)"
     sni="$(proto_value vless_reality sni)"
@@ -1206,6 +1322,9 @@ protocol_link_rows() {
   fi
   if [[ "$(proto_value vmess_ws enabled false)" == "true" ]]; then
     local port uuid tls vmess
+    select_protocol_hosts vmess_ws || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     port="$(proto_value vmess_ws port)"
     uuid="$(proto_value vmess_ws uuid)"
     tls="$(proto_value vmess_ws tls false)"
@@ -1220,6 +1339,9 @@ PY
   fi
   if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
     local hy_password hy_sni hy_port hy_hop_start hy_hop_end hy_mport
+    select_protocol_hosts hysteria2 || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     hy_password="$(url_encode "$(proto_value hysteria2 password)")"
     hy_sni="$(proto_value hysteria2 sni "${SNI_OPTIONS[0]}")"
     hy_port="$(proto_value hysteria2 port)"
@@ -1230,6 +1352,9 @@ PY
   fi
   if [[ "$(proto_value tuic enabled false)" == "true" ]]; then
     local tuic_auth tuic_sni
+    select_protocol_hosts tuic || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     tuic_auth="$(python3 - "$(proto_value tuic uuid)" "$(proto_value tuic password)" <<'PY'
 import sys, urllib.parse
 print(urllib.parse.quote(f"{sys.argv[1]}:{sys.argv[2]}", safe=":"), end="")
@@ -1240,6 +1365,9 @@ PY
   fi
   if [[ "$(proto_value anytls enabled false)" == "true" ]]; then
     local any_sni any_port any_password
+    select_protocol_hosts anytls || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     any_sni="$(proto_value anytls sni "${SNI_OPTIONS[0]}")"
     any_port="$(proto_value anytls port)"
     any_password="$(url_encode "$(proto_value anytls password)")"
@@ -1247,12 +1375,18 @@ PY
   fi
   if [[ "$(proto_value trojan enabled false)" == "true" ]]; then
     local trojan_password trojan_sni
+    select_protocol_hosts trojan || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     trojan_password="$(url_encode "$(proto_value trojan password)")"
     trojan_sni="$(proto_value trojan sni "${SNI_OPTIONS[0]}")"
     printf 'Trojan\ttrojan://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&type=tcp#Trojan\n' "$trojan_password" "$url_host" "$(proto_value trojan port)" "$trojan_sni"
   fi
   if [[ "$(proto_value shadowsocks enabled false)" == "true" ]]; then
     local ss_userinfo
+    select_protocol_hosts shadowsocks || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     ss_userinfo="$(python3 - "$(proto_value shadowsocks method aes-128-gcm)" "$(proto_value shadowsocks password)" <<'PY'
 import base64, sys
 print(base64.urlsafe_b64encode(f"{sys.argv[1]}:{sys.argv[2]}".encode()).decode().rstrip("="), end="")
@@ -1262,6 +1396,9 @@ PY
   fi
   if [[ "$(proto_value vmess_tcp enabled false)" == "true" ]]; then
     local vmess_tcp
+    select_protocol_hosts vmess_tcp || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     vmess_tcp="$(python3 - "$host" "$(proto_value vmess_tcp port)" "$(proto_value vmess_tcp uuid)" <<'PY'
 import base64, json, sys
 host, port, uuid = sys.argv[1:]
@@ -1273,6 +1410,9 @@ PY
   fi
   if [[ "$(proto_value vmess_http enabled false)" == "true" ]]; then
     local vmess_http
+    select_protocol_hosts vmess_http || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     vmess_http="$(python3 - "$host" "$(proto_value vmess_http port)" "$(proto_value vmess_http uuid)" "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")" "$(proto_value vmess_http path /vmess-http)" <<'PY'
 import base64, json, sys
 host, port, uuid, http_host, path = sys.argv[1:]
@@ -1284,6 +1424,9 @@ PY
   fi
   if [[ "$(proto_value mixed enabled false)" == "true" ]]; then
     local user pass auth
+    select_protocol_hosts mixed || return 1
+    host="$PROTOCOL_HOST"
+    url_host="$PROTOCOL_URL_HOST"
     user="$(url_encode "$(proto_value mixed username daimon)")"
     pass="$(url_encode "$(proto_value mixed password daimon)")"
     auth="${user}:${pass}"
@@ -1294,18 +1437,24 @@ PY
 generate_subscription() {
   ensure_state
   ensure_dirs
-  local token raw v2rayn_raw sub_file host pin
+  local token raw v2rayn_raw sub_file ipv4 ipv6 pin
+  detect_public_ips || {
+    fail "未检测到可用的公网 IPv4 或 IPv6，无法生成订阅。"
+    return 1
+  }
+  validate_protocol_hosts || return 1
   token="$(state_value token)"
-  host="$(server_host)"
+  ipv4="$DETECTED_PUBLIC_IPV4"
+  ipv6="$DETECTED_PUBLIC_IPV6"
   pin="$(cert_pin_sha256)"
   raw="$SUB/raw.txt"
   v2rayn_raw="$SUB/v2rayn_raw.txt"
   sub_file="$SUB/sub.txt"
   protocol_link_rows | cut -f2- >"$raw"
-  python3 - "$STATE" "$SUB/clash.yaml" "$v2rayn_raw" "$host" "$pin" "$CERT/self.crt" <<'PY'
+  python3 - "$STATE" "$SUB/clash.yaml" "$v2rayn_raw" "$ipv4" "$ipv6" "$pin" "$CERT/self.crt" <<'PY'
 import base64, json, sys, urllib.parse
 
-state_path, clash_path, v2rayn_path, host, pin, cert_path = sys.argv[1:7]
+state_path, clash_path, v2rayn_path, ipv4, ipv6, pin, cert_path = sys.argv[1:8]
 data = json.load(open(state_path, encoding="utf-8"))
 protos = data.get("protocols", {})
 try:
@@ -1336,6 +1485,18 @@ def enabled(name):
 def val(name, key, default=""):
     return protos.get(name, {}).get(key, default)
 
+def host_for(name):
+    version = val(name, "ip_version", "auto")
+    if version == "ipv4":
+        if not ipv4:
+            raise ValueError(f"{name} selected IPv4 but no public IPv4 was detected")
+        return ipv4
+    if version == "ipv6":
+        if not ipv6:
+            raise ValueError(f"{name} selected IPv6 but no public IPv6 was detected")
+        return ipv6
+    return ipv4 or ipv6
+
 proxies = []
 names = []
 
@@ -1346,7 +1507,7 @@ def add(name, lines):
 if enabled("vless_reality"):
     add("Vless-reality", [
         "    type: vless",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('vless_reality'))}",
         f"    port: {val('vless_reality', 'port')}",
         f"    uuid: {q(val('vless_reality', 'uuid'))}",
         "    network: tcp",
@@ -1363,7 +1524,7 @@ if enabled("vless_reality"):
 if enabled("vmess_ws"):
     add("Vmess-ws", [
         "    type: vmess",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('vmess_ws'))}",
         f"    port: {val('vmess_ws', 'port')}",
         f"    uuid: {q(val('vmess_ws', 'uuid'))}",
         "    alterId: 0",
@@ -1379,7 +1540,7 @@ if enabled("hysteria2"):
     hs, he = val("hysteria2", "hop_start"), val("hysteria2", "hop_end")
     lines = [
         "    type: hysteria2",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('hysteria2'))}",
         f"    port: {val('hysteria2', 'port')}",
         f"    password: {q(val('hysteria2', 'password'))}",
         f"    sni: {q(val('hysteria2', 'sni', 'www.bing.com'))}",
@@ -1397,7 +1558,7 @@ if enabled("hysteria2"):
 if enabled("tuic"):
     add("Tuic-v5", [
         "    type: tuic",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('tuic'))}",
         f"    port: {val('tuic', 'port')}",
         f"    uuid: {q(val('tuic', 'uuid'))}",
         f"    password: {q(val('tuic', 'password'))}",
@@ -1414,7 +1575,7 @@ if enabled("tuic"):
 if enabled("anytls"):
     add("Anytls", [
         "    type: anytls",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('anytls'))}",
         f"    port: {val('anytls', 'port')}",
         f"    password: {q(val('anytls', 'password'))}",
         "    client-fingerprint: chrome",
@@ -1429,7 +1590,7 @@ if enabled("anytls"):
 if enabled("trojan"):
     add("Trojan", [
         "    type: trojan",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('trojan'))}",
         f"    port: {val('trojan', 'port')}",
         f"    password: {q(val('trojan', 'password'))}",
         f"    sni: {q(val('trojan', 'sni', 'www.bing.com'))}",
@@ -1440,7 +1601,7 @@ if enabled("trojan"):
 if enabled("shadowsocks"):
     add("Shadowsocks", [
         "    type: ss",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('shadowsocks'))}",
         f"    port: {val('shadowsocks', 'port')}",
         f"    cipher: {q(val('shadowsocks', 'method', 'aes-128-gcm'))}",
         f"    password: {q(val('shadowsocks', 'password'))}",
@@ -1450,7 +1611,7 @@ if enabled("shadowsocks"):
 if enabled("vmess_tcp"):
     add("Vmess-tcp", [
         "    type: vmess",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('vmess_tcp'))}",
         f"    port: {val('vmess_tcp', 'port')}",
         f"    uuid: {q(val('vmess_tcp', 'uuid'))}",
         "    alterId: 0",
@@ -1463,7 +1624,7 @@ if enabled("vmess_tcp"):
 if enabled("vmess_http"):
     add("Vmess-http", [
         "    type: vmess",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('vmess_http'))}",
         f"    port: {val('vmess_http', 'port')}",
         f"    uuid: {q(val('vmess_http', 'uuid'))}",
         "    alterId: 0",
@@ -1483,7 +1644,7 @@ if enabled("vmess_http"):
 if enabled("mixed"):
     add("Mixed-SOCKS5", [
         "    type: socks5",
-        f"    server: {q(host)}",
+        f"    server: {q(host_for('mixed'))}",
         f"    port: {val('mixed', 'port')}",
         f"    username: {q(val('mixed', 'username', 'daimon'))}",
         f"    password: {q(val('mixed', 'password', 'daimon'))}",
@@ -1519,10 +1680,10 @@ open(clash_path, "w", encoding="utf-8").write("\n".join(out))
 v2 = []
 if enabled("vless_reality"):
     v2.append("vless://{}@{}:{}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={}&fp=chrome&pbk={}&sid={}&type=tcp#Vless-reality".format(
-        u(val("vless_reality", "uuid")), uri_host(host), val("vless_reality", "port"), u(val("vless_reality", "sni")),
+        u(val("vless_reality", "uuid")), uri_host(host_for("vless_reality")), val("vless_reality", "port"), u(val("vless_reality", "sni")),
         u(val("vless_reality", "public_key")), u(val("vless_reality", "short_id"))))
 if enabled("vmess_ws"):
-    vm = {"v":"2","ps":"Vmess-ws","add":host,"port":str(val("vmess_ws", "port")),"id":val("vmess_ws", "uuid"),"aid":"0","scy":"auto","net":"ws","type":"none","host":"","path":"/vmess","tls":"tls" if val("vmess_ws", "tls", False) is True else ""}
+    vm = {"v":"2","ps":"Vmess-ws","add":host_for("vmess_ws"),"port":str(val("vmess_ws", "port")),"id":val("vmess_ws", "uuid"),"aid":"0","scy":"auto","net":"ws","type":"none","host":"","path":"/vmess","tls":"tls" if val("vmess_ws", "tls", False) is True else ""}
     v2.append("vmess://" + b64(json.dumps(vm, separators=(",", ":"), ensure_ascii=False)))
 if enabled("hysteria2"):
     extra = {"UpMbps": 200, "DownMbps": 1000}
@@ -1530,28 +1691,28 @@ if enabled("hysteria2"):
     if hs and he:
         extra["Ports"] = f"{hs}-{he}"
         extra["HopInterval"] = "30"
-    item = {"ConfigType":7,"CoreType":24,"ConfigVersion":4,"Remarks":"Hysteria-2","Address":host,"Port":val("hysteria2", "port"),"Password":val("hysteria2", "password"),"StreamSecurity":"tls","AllowInsecure":"true","Sni":val("hysteria2", "sni", "www.bing.com"),"Alpn":"h3","ProtoExtraObj":extra}
+    item = {"ConfigType":7,"CoreType":24,"ConfigVersion":4,"Remarks":"Hysteria-2","Address":host_for("hysteria2"),"Port":val("hysteria2", "port"),"Password":val("hysteria2", "password"),"StreamSecurity":"tls","AllowInsecure":"true","Sni":val("hysteria2", "sni", "www.bing.com"),"Alpn":"h3","ProtoExtraObj":extra}
     v2.append("v2rayn://hysteria2/" + b64url_json(item))
 if enabled("tuic"):
-    item = {"ConfigType":8,"CoreType":24,"ConfigVersion":4,"Remarks":"Tuic-v5","Address":host,"Port":val("tuic", "port"),"Username":val("tuic", "uuid"),"Password":val("tuic", "password"),"StreamSecurity":"tls","AllowInsecure":"true","Sni":val("tuic", "sni", "www.bing.com"),"Alpn":"h3","ProtoExtraObj":{"CongestionControl":"bbr"}}
+    item = {"ConfigType":8,"CoreType":24,"ConfigVersion":4,"Remarks":"Tuic-v5","Address":host_for("tuic"),"Port":val("tuic", "port"),"Username":val("tuic", "uuid"),"Password":val("tuic", "password"),"StreamSecurity":"tls","AllowInsecure":"true","Sni":val("tuic", "sni", "www.bing.com"),"Alpn":"h3","ProtoExtraObj":{"CongestionControl":"bbr"}}
     v2.append("v2rayn://tuic/" + b64url_json(item))
 if enabled("anytls"):
-    item = {"ConfigType":11,"CoreType":24,"ConfigVersion":4,"Remarks":"Anytls","Address":host,"Port":val("anytls", "port"),"Password":val("anytls", "password"),"StreamSecurity":"tls","AllowInsecure":"false","Sni":val("anytls", "sni", "www.bing.com"),"Fingerprint":"chrome","Cert":cert}
+    item = {"ConfigType":11,"CoreType":24,"ConfigVersion":4,"Remarks":"Anytls","Address":host_for("anytls"),"Port":val("anytls", "port"),"Password":val("anytls", "password"),"StreamSecurity":"tls","AllowInsecure":"false","Sni":val("anytls", "sni", "www.bing.com"),"Fingerprint":"chrome","Cert":cert}
     v2.append("v2rayn://anytls/" + b64url_json(item))
 if enabled("trojan"):
     v2.append("trojan://{}@{}:{}?security=tls&sni={}&insecure=1&allowInsecure=1&allow_insecure=1&type=tcp#Trojan".format(
-        u(val("trojan", "password")), uri_host(host), val("trojan", "port"), u(val("trojan", "sni", "www.bing.com"))))
+        u(val("trojan", "password")), uri_host(host_for("trojan")), val("trojan", "port"), u(val("trojan", "sni", "www.bing.com"))))
 if enabled("shadowsocks"):
     userinfo = base64.urlsafe_b64encode(f"{val('shadowsocks', 'method', 'aes-128-gcm')}:{val('shadowsocks', 'password')}".encode()).decode().rstrip("=")
-    v2.append("ss://{}@{}:{}#Shadowsocks".format(userinfo, uri_host(host), val("shadowsocks", "port")))
+    v2.append("ss://{}@{}:{}#Shadowsocks".format(userinfo, uri_host(host_for("shadowsocks")), val("shadowsocks", "port")))
 if enabled("vmess_tcp"):
-    vm = {"v":"2","ps":"Vmess-tcp","add":host,"port":str(val("vmess_tcp", "port")),"id":val("vmess_tcp", "uuid"),"aid":"0","scy":"auto","net":"tcp","type":"none","host":"","path":"","tls":""}
+    vm = {"v":"2","ps":"Vmess-tcp","add":host_for("vmess_tcp"),"port":str(val("vmess_tcp", "port")),"id":val("vmess_tcp", "uuid"),"aid":"0","scy":"auto","net":"tcp","type":"none","host":"","path":"","tls":""}
     v2.append("vmess://" + b64(json.dumps(vm, separators=(",", ":"), ensure_ascii=False)))
 if enabled("vmess_http"):
-    vm = {"v":"2","ps":"Vmess-http","add":host,"port":str(val("vmess_http", "port")),"id":val("vmess_http", "uuid"),"aid":"0","scy":"auto","net":"http","type":"none","host":val("vmess_http", "host", "www.bing.com"),"path":val("vmess_http", "path", "/vmess-http"),"tls":""}
+    vm = {"v":"2","ps":"Vmess-http","add":host_for("vmess_http"),"port":str(val("vmess_http", "port")),"id":val("vmess_http", "uuid"),"aid":"0","scy":"auto","net":"http","type":"none","host":val("vmess_http", "host", "www.bing.com"),"path":val("vmess_http", "path", "/vmess-http"),"tls":""}
     v2.append("vmess://" + b64(json.dumps(vm, separators=(",", ":"), ensure_ascii=False)))
 if enabled("mixed"):
-    item = {"ConfigType":4,"CoreType":24,"ConfigVersion":4,"Remarks":"Mixed-SOCKS5","Address":host,"Port":val("mixed", "port"),"Username":val("mixed", "username", "daimon"),"Password":val("mixed", "password", "daimon")}
+    item = {"ConfigType":4,"CoreType":24,"ConfigVersion":4,"Remarks":"Mixed-SOCKS5","Address":host_for("mixed"),"Port":val("mixed", "port"),"Username":val("mixed", "username", "daimon"),"Password":val("mixed", "password", "daimon")}
     v2.append("v2rayn://socks/" + b64url_json(item))
 open(v2rayn_path, "w", encoding="utf-8").write("\n".join(v2) + ("\n" if v2 else ""))
 PY
@@ -1986,16 +2147,18 @@ require_core_installed() {
 
 add_mixed() {
   local port username password
+  choose_node_ip_version "Mixed" || return 1
   port="$(ask_port "Mixed" 30000)"
   username="$(ask_text "Mixed 用户名" "daimon")"
   password="$(ask_text "Mixed 密码" "daimon")"
-  set_protocol mixed "port=$port" "username=$username" "password=$password"
+  set_protocol mixed "port=$port" "username=$username" "password=$password" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_vless_reality() {
   local port uuid sni short_id keys private_key public_key
   require_core_installed || return 1
+  choose_node_ip_version "Vless-reality" || return 1
   port="$(ask_port "Vless-reality" "$(random_free_port)")"
   uuid="$(ask_text "Vless-reality UUID" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
@@ -2007,105 +2170,121 @@ add_vless_reality() {
     fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
     return 1
   fi
-  set_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key"
+  set_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_vmess_ws() {
   local port uuid yn tls
+  choose_node_ip_version "Vmess-ws" || return 1
   port="$(ask_port "Vmess-ws" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-ws UUID" "$(rand_uuid)")"
   ask_yes_no "是否开启 VMess-WS TLS？" n && tls=true || tls=false
-  set_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls"
+  set_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_hysteria2() {
   local port password sni hop_start hop_end
+  choose_node_ip_version "Hysteria-2" || return 1
   port="$(ask_port "Hysteria-2" "$(random_free_port)")"
   password="$(ask_text "Hysteria-2 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
   IFS=$'\t' read -r hop_start hop_end < <(ask_hopping "Hysteria-2")
-  set_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end"
+  set_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_tuic() {
   local port uuid password sni
+  choose_node_ip_version "Tuic-v5" || return 1
   port="$(ask_port "Tuic-v5" "$(random_free_port)")"
   uuid="$(ask_text "Tuic-v5 UUID" "$(rand_uuid)")"
   password="$(ask_text "Tuic-v5 密码" "$uuid")"
   sni="$(pick_sni "$(random_sni)")"
-  set_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end="
+  set_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end=" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_anytls() {
   local port password sni
+  choose_node_ip_version "Anytls" || return 1
   port="$(ask_port "Anytls" "$(random_free_port)")"
   password="$(ask_text "Anytls 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
-  set_protocol anytls "port=$port" "password=$password" "sni=$sni"
+  set_protocol anytls "port=$port" "password=$password" "sni=$sni" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_trojan() {
   local port password sni
+  choose_node_ip_version "Trojan" || return 1
   port="$(ask_port "Trojan" "$(random_free_port)")"
   password="$(ask_text "Trojan 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
-  set_protocol trojan "port=$port" "password=$password" "sni=$sni"
+  set_protocol trojan "port=$port" "password=$password" "sni=$sni" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_shadowsocks() {
   local port password method
+  choose_node_ip_version "Shadowsocks" || return 1
   port="$(ask_port "Shadowsocks" "$(random_free_port)")"
   password="$(ask_text "Shadowsocks 密码" "$(rand_uuid)")"
   method="$(ask_text "Shadowsocks 加密方式" "aes-128-gcm")"
-  set_protocol shadowsocks "port=$port" "password=$password" "method=$method"
+  set_protocol shadowsocks "port=$port" "password=$password" "method=$method" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_vmess_tcp() {
   local port uuid
+  choose_node_ip_version "Vmess-tcp" || return 1
   port="$(ask_port "Vmess-tcp" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-tcp UUID" "$(rand_uuid)")"
-  set_protocol vmess_tcp "port=$port" "uuid=$uuid"
+  set_protocol vmess_tcp "port=$port" "uuid=$uuid" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_vmess_http() {
   local port uuid host path
+  choose_node_ip_version "Vmess-http" || return 1
   port="$(ask_port "Vmess-http" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-http UUID" "$(rand_uuid)")"
   host="$(pick_sni "$(random_sni)")"
   path="$(ask_text "Vmess-http 路径" "/vmess-http")"
   [[ "$path" == /* ]] || path="/$path"
-  set_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path"
+  set_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
 }
 
 add_all_protocols() {
+  local proto needs_ip=false
   ensure_state
   require_core_installed || return 1
-  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon"
+  for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls; do
+    if ! protocol_exists "$proto"; then
+      needs_ip=true
+      break
+    fi
+  done
+  [[ "$needs_ip" == "false" ]] || choose_node_ip_version "一键添加协议" || return 1
+  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon" "ip_version=$SELECTED_IP_VERSION"
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] || {
     local keys private_key public_key
     keys="$(reality_keypair || true)"
     private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
     public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
     [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"; return 1; }
-    set_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key"
+    set_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key" "ip_version=$SELECTED_IP_VERSION"
   }
-  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false"
-  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end="
+  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false" "ip_version=$SELECTED_IP_VERSION"
+  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end=" "ip_version=$SELECTED_IP_VERSION"
   if [[ "$(proto_value tuic enabled false)" != "true" ]]; then
     local tuic_uuid
     tuic_uuid="$(rand_uuid)"
-    set_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end="
+    set_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end=" "ip_version=$SELECTED_IP_VERSION"
   fi
-  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)"
+  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "ip_version=$SELECTED_IP_VERSION"
   rebuild_configs
   info "一键协议已生成。"
   show_protocol_details
@@ -2261,6 +2440,12 @@ add_protocol_menu() {
   return 0
 }
 
+change_protocol_ip_version() {
+  local proto="$1" label="$2"
+  choose_node_ip_version "$label" || return 1
+  set_protocol "$proto" "ip_version=$SELECTED_IP_VERSION"
+}
+
 change_protocol_config() {
   ensure_state
   require_core_installed || return 0
@@ -2284,18 +2469,19 @@ change_protocol_config() {
   protocol_exists "$proto" || { warn "$label 尚未添加。"; return 0; }
   case "$proto" in
     mixed)
-      printf "1. 修改端口\n2. 修改用户名\n3. 修改密码\n0. 返回\n"
-      field="$(ask_menu "请选择: " 3)"
+      printf "1. 修改端口\n2. 修改用户名\n3. 修改密码\n4. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(proto_value mixed port 30000)" "$(proto_value mixed port)")"; set_protocol mixed "port=$port" ;;
         2) value="$(ask_text "Mixed 用户名" "$(proto_value mixed username daimon)")"; set_protocol mixed "username=$value" ;;
         3) value="$(ask_text "Mixed 密码" "$(proto_value mixed password daimon)")"; set_protocol mixed "password=$value" ;;
+        4) change_protocol_ip_version mixed "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vless_reality)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 重新生成 Reality 密钥\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 重新生成 Reality 密钥\n5. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vless_reality port)")" "$(proto_value vless_reality port)")"; set_protocol vless_reality "port=$port" ;;
         2) value="$(ask_text "Vless-reality UUID" "$(proto_value vless_reality uuid)")"; set_protocol vless_reality "uuid=$value" ;;
@@ -2308,88 +2494,97 @@ change_protocol_config() {
           [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败。"; return 0; }
           set_protocol vless_reality "private_key=$private_key" "public_key=$public_key" "short_id=$(rand_hex 8)"
           ;;
+        5) change_protocol_ip_version vless_reality "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vmess_ws)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 开关 TLS\n0. 返回\n"
-      field="$(ask_menu "请选择: " 3)"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 开关 TLS\n4. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_ws port)")" "$(proto_value vmess_ws port)")"; set_protocol vmess_ws "port=$port" ;;
         2) value="$(ask_text "Vmess-ws UUID" "$(proto_value vmess_ws uuid)")"; set_protocol vmess_ws "uuid=$value" ;;
         3) ask_yes_no "是否开启 VMess-WS TLS？" "$([[ "$(proto_value vmess_ws tls false)" == "true" ]] && printf y || printf n)" && set_protocol vmess_ws "tls=true" || set_protocol vmess_ws "tls=false" ;;
+        4) change_protocol_ip_version vmess_ws "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     hysteria2)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 设置跳跃端口\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 设置跳跃端口\n5. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value hysteria2 port)")" "$(proto_value hysteria2 port)")"; set_protocol hysteria2 "port=$port" ;;
         2) value="$(ask_text "Hysteria-2 密码" "$(proto_value hysteria2 password)")"; set_protocol hysteria2 "password=$value" ;;
         3) value="$(pick_sni "$(proto_value hysteria2 sni "${SNI_OPTIONS[0]}")")"; set_protocol hysteria2 "sni=$value" ;;
         4) IFS=$'\t' read -r hop_start hop_end < <(ask_hopping "$label" "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")"); set_protocol hysteria2 "hop_start=$hop_start" "hop_end=$hop_end" ;;
+        5) change_protocol_ip_version hysteria2 "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     tuic)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改密码\n4. 修改 SNI\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改密码\n4. 修改 SNI\n5. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value tuic port)")" "$(proto_value tuic port)")"; set_protocol tuic "port=$port" ;;
         2) value="$(ask_text "Tuic-v5 UUID" "$(proto_value tuic uuid)")"; set_protocol tuic "uuid=$value" ;;
         3) value="$(ask_text "Tuic-v5 密码" "$(proto_value tuic password)")"; set_protocol tuic "password=$value" ;;
         4) value="$(pick_sni "$(proto_value tuic sni "${SNI_OPTIONS[0]}")")"; set_protocol tuic "sni=$value" ;;
+        5) change_protocol_ip_version tuic "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     anytls)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n0. 返回\n"
-      field="$(ask_menu "请选择: " 3)"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value anytls port)")" "$(proto_value anytls port)")"; set_protocol anytls "port=$port" ;;
         2) value="$(ask_text "Anytls 密码" "$(proto_value anytls password)")"; set_protocol anytls "password=$value" ;;
         3) value="$(pick_sni "$(proto_value anytls sni "${SNI_OPTIONS[0]}")")"; set_protocol anytls "sni=$value" ;;
+        4) change_protocol_ip_version anytls "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     trojan)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n0. 返回\n"
-      field="$(ask_menu "请选择: " 3)"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value trojan port)")" "$(proto_value trojan port)")"; set_protocol trojan "port=$port" ;;
         2) value="$(ask_text "Trojan 密码" "$(proto_value trojan password)")"; set_protocol trojan "password=$value" ;;
         3) value="$(pick_sni "$(proto_value trojan sni "${SNI_OPTIONS[0]}")")"; set_protocol trojan "sni=$value" ;;
+        4) change_protocol_ip_version trojan "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     shadowsocks)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改加密方式\n0. 返回\n"
-      field="$(ask_menu "请选择: " 3)"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改加密方式\n4. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value shadowsocks port)")" "$(proto_value shadowsocks port)")"; set_protocol shadowsocks "port=$port" ;;
         2) value="$(ask_text "Shadowsocks 密码" "$(proto_value shadowsocks password)")"; set_protocol shadowsocks "password=$value" ;;
         3) value="$(ask_text "Shadowsocks 加密方式" "$(proto_value shadowsocks method aes-128-gcm)")"; set_protocol shadowsocks "method=$value" ;;
+        4) change_protocol_ip_version shadowsocks "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vmess_tcp)
-      printf "1. 修改端口\n2. 修改 UUID\n0. 返回\n"
-      field="$(ask_menu "请选择: " 2)"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 3)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_tcp port)")" "$(proto_value vmess_tcp port)")"; set_protocol vmess_tcp "port=$port" ;;
         2) value="$(ask_text "Vmess-tcp UUID" "$(proto_value vmess_tcp uuid)")"; set_protocol vmess_tcp "uuid=$value" ;;
+        3) change_protocol_ip_version vmess_tcp "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vmess_http)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 Host\n4. 修改路径\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 Host\n4. 修改路径\n5. 修改节点 IP 类型\n0. 返回\n"
+      field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_http port)")" "$(proto_value vmess_http port)")"; set_protocol vmess_http "port=$port" ;;
         2) value="$(ask_text "Vmess-http UUID" "$(proto_value vmess_http uuid)")"; set_protocol vmess_http "uuid=$value" ;;
         3) value="$(pick_sni "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")")"; set_protocol vmess_http "host=$value" ;;
         4) value="$(ask_text "Vmess-http 路径" "$(proto_value vmess_http path /vmess-http)")"; [[ "$value" == /* ]] || value="/$value"; set_protocol vmess_http "path=$value" ;;
+        5) change_protocol_ip_version vmess_http "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
@@ -2566,29 +2761,29 @@ show_protocols() {
     return
   fi
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] &&
-    printf "${YELLOW}【 Vless-reality 】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}Reality域名证书伪装地址:${NC}${MAGENTA}%s${NC}\n" "$(proto_value vless_reality port)" "$(proto_value vless_reality sni)"
+    printf "${YELLOW}【 Vless-reality 】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}Reality域名证书伪装地址:${NC}${MAGENTA}%s${NC}\n" "$(proto_value vless_reality port)" "$(proto_ip_label vless_reality)" "$(proto_value vless_reality sni)"
   [[ "$(proto_value vmess_ws enabled false)" == "true" ]] &&
-    printf "${YELLOW}【   Vmess-ws    】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}   ${CYAN}证书形式:${NC}%b\n" "$(proto_value vmess_ws port)" "$(color_status "$([[ "$(proto_value vmess_ws tls false)" == "true" ]] && printf '自签证书' || printf 'TLS关闭')")"
+    printf "${YELLOW}【   Vmess-ws    】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}%b\n" "$(proto_value vmess_ws port)" "$(proto_ip_label vmess_ws)" "$(color_status "$([[ "$(proto_value vmess_ws tls false)" == "true" ]] && printf '自签证书' || printf 'TLS关闭')")"
   if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
     local hy_hop="未添加"
     [[ -n "$(proto_value hysteria2 hop_start "")" && -n "$(proto_value hysteria2 hop_end "")" ]] && hy_hop="$(proto_value hysteria2 hop_start)-$(proto_value hysteria2 hop_end)"
-    printf "${YELLOW}【  Hysteria-2   】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}证书形式:${NC}自签证书  ${CYAN}转发多端口:${NC}%b\n" "$(proto_value hysteria2 port)" "$(color_status "$hy_hop")"
+    printf "${YELLOW}【  Hysteria-2   】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}自签证书  ${CYAN}转发多端口:${NC}%b\n" "$(proto_value hysteria2 port)" "$(proto_ip_label hysteria2)" "$(color_status "$hy_hop")"
   fi
   if [[ "$(proto_value tuic enabled false)" == "true" ]]; then
-    printf "${YELLOW}【    Tuic-v5    】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}证书形式:${NC}自签证书\n" "$(proto_value tuic port)"
+    printf "${YELLOW}【    Tuic-v5    】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}自签证书\n" "$(proto_value tuic port)" "$(proto_ip_label tuic)"
   fi
   [[ "$(proto_value anytls enabled false)" == "true" ]] &&
-    printf "${YELLOW}【    Anytls     】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}证书形式:${NC}自签证书\n" "$(proto_value anytls port)"
+    printf "${YELLOW}【    Anytls     】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}自签证书\n" "$(proto_value anytls port)" "$(proto_ip_label anytls)"
   [[ "$(proto_value trojan enabled false)" == "true" ]] &&
-    printf "${YELLOW}【    Trojan     】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}证书形式:${NC}自签证书\n" "$(proto_value trojan port)"
+    printf "${YELLOW}【    Trojan     】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}自签证书\n" "$(proto_value trojan port)" "$(proto_ip_label trojan)"
   [[ "$(proto_value shadowsocks enabled false)" == "true" ]] &&
-    printf "${YELLOW}【 Shadowsocks  】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}加密方式:${NC}%s\n" "$(proto_value shadowsocks port)" "$(proto_value shadowsocks method aes-128-gcm)"
+    printf "${YELLOW}【 Shadowsocks  】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}加密方式:${NC}%s\n" "$(proto_value shadowsocks port)" "$(proto_ip_label shadowsocks)" "$(proto_value shadowsocks method aes-128-gcm)"
   [[ "$(proto_value vmess_tcp enabled false)" == "true" ]] &&
-    printf "${YELLOW}【   Vmess-tcp   】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}证书形式:${NC}%b\n" "$(proto_value vmess_tcp port)" "$(color_status TLS关闭)"
+    printf "${YELLOW}【   Vmess-tcp   】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}%b\n" "$(proto_value vmess_tcp port)" "$(proto_ip_label vmess_tcp)" "$(color_status TLS关闭)"
   [[ "$(proto_value vmess_http enabled false)" == "true" ]] &&
-    printf "${YELLOW}【  Vmess-http   】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}Host:${NC}${MAGENTA}%s${NC}  ${CYAN}路径:${NC}%s\n" "$(proto_value vmess_http port)" "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")" "$(proto_value vmess_http path /vmess-http)"
+    printf "${YELLOW}【  Vmess-http   】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}Host:${NC}${MAGENTA}%s${NC}  ${CYAN}路径:${NC}%s\n" "$(proto_value vmess_http port)" "$(proto_ip_label vmess_http)" "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")" "$(proto_value vmess_http path /vmess-http)"
   [[ "$(proto_value mixed enabled false)" == "true" ]] &&
-    printf "${YELLOW}【    Mixed      】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}包含:${NC}HTTP/SOCKS5\n" "$(proto_value mixed port)"
+    printf "${YELLOW}【    Mixed      】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}包含:${NC}HTTP/SOCKS5\n" "$(proto_value mixed port)" "$(proto_ip_label mixed)"
   printf "\n"
   show_subscription_links
   printf "\n"
