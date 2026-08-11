@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.3.0"
+SCRIPT_VERSION="1.3.1"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -2118,6 +2118,21 @@ download_core() {
   file="$(find "$tmp" -type f -name sing-box | head -n1)"
   [[ -n "$file" ]] || { fail "压缩包内未找到 sing-box。"; return 1; }
   install -m 0755 "$file" "$BIN"
+  if ! chmod 0755 "$BIN"; then
+    rm -rf "$tmp"
+    fail "无法设置 sing-box 内核执行权限。"
+    return 1
+  fi
+  if [[ ! -x "$BIN" ]]; then
+    rm -rf "$tmp"
+    fail "sing-box 内核缺少执行权限。"
+    return 1
+  fi
+  if ! "$BIN" version >/dev/null 2>&1; then
+    rm -rf "$tmp"
+    fail "sing-box 内核无法执行，请检查文件权限或文件系统挂载选项。"
+    return 1
+  fi
   rm -rf "$tmp"
 }
 
