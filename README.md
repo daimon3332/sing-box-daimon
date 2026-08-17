@@ -312,9 +312,11 @@ http://IP:2096/sub/token/mihomo
 - 状态页：脚本版本、最新状态、UFW 状态、缺失端口、系统、内核、架构、虚拟化、BBR、IP、地区、服务状态
 - 协议管理：Mixed、VLESS Reality、VMess WS、Hysteria2、TUIC v5、AnyTLS、Trojan、Shadowsocks、VMess TCP、VMess HTTP
 - 一键添加协议：一次生成 Mixed / VLESS Reality / VMess WS / Hysteria2 / TUIC v5 / AnyTLS
-- 添加协议时自动检测公网 IPv4/IPv6：单栈自动使用可用地址，双栈由用户选择节点地址类型
-- 一键添加协议在双栈 VPS 上只询问一次 IP 类型，并应用到本次新建的全部默认协议
-- 每个协议独立保存节点 IP 类型，可在修改协议菜单中切换；只影响客户端连接 VPS 的节点地址，不限制 VPS 的 Direct 出站
+- 添加协议时自动检测公网 IPv4/IPv6：可使用检测地址，也可手动输入客户端连接地址
+- 一键添加协议只询问一次客户端连接地址，并应用到本次新建的全部默认协议
+- 添加协议时支持放弃自动检测，手动输入客户端连接 IPv4、IPv6 或域名，适配 NAT 入口地址
+- NAT 模式节点端口继续使用内部监听端口，外部相同端口映射由用户在 NAT 服务商页面配置
+- 每个协议独立保存客户端连接地址，可在修改协议菜单中切换；不限制 VPS 的 Direct 出站
 - 手动添加协议额外支持 Trojan、Shadowsocks、VMess TCP、VMess HTTP；一键添加协议保持精简默认组合
 - 添加、更改、删除协议后会立即检查配置并应用运行态；删除所有协议会停止 sing-box
 - 查看协议时只读取并显示节点信息，不会重建配置或改动防火墙

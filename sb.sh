@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.3.1"
+SCRIPT_VERSION="1.4.0"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -166,6 +166,17 @@ raise SystemExit(0 if address.version == int(sys.argv[2]) else 1)
 PY
 }
 
+endpoint_host_value() {
+  local host="$1"
+  host="${host#[}"
+  host="${host%]}"
+  if valid_ip_address "$host" 4 || valid_ip_address "$host" 6 || valid_domain "$host"; then
+    printf '%s' "$host"
+    return 0
+  fi
+  return 1
+}
+
 ensure_dirs() {
   mkdir -p "$ROOT/bin" "$CONF" "$CERT" "$SUB" "$LOG" "$FIREWALL"
 }
@@ -178,6 +189,7 @@ import json, secrets, sys
 state = {
   "token": secrets.token_hex(16),
   "sub_port": 2096,
+  "sub_endpoint_host": "",
   "sub_domain": "",
   "sub_tls": False,
   "protocols": {}
@@ -1159,6 +1171,12 @@ public_ipv4() {
   valid_ip_address "$ip" 4 && printf '%s' "$ip" || true
 }
 
+set_selected_protocol() {
+  local proto="$1"
+  shift
+  set_protocol "$proto" "$@" "ip_version=$SELECTED_IP_VERSION" "endpoint_host=$SELECTED_ENDPOINT_HOST"
+}
+
 public_ipv6() {
   local ip
   ip="$(curl -6fs --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
@@ -1170,6 +1188,7 @@ PUBLIC_IPS_CHECKED=0
 DETECTED_PUBLIC_IPV4=""
 DETECTED_PUBLIC_IPV6=""
 SELECTED_IP_VERSION=""
+SELECTED_ENDPOINT_HOST=""
 PROTOCOL_HOST=""
 PROTOCOL_URL_HOST=""
 
@@ -1188,57 +1207,85 @@ detect_public_ips() {
 }
 
 choose_node_ip_version() {
-  local label="$1" choice
+  local label="$1" choice input detected=false
   SELECTED_IP_VERSION=""
-  if ! detect_public_ips true; then
-    fail "未检测到可用的公网 IPv4 或 IPv6，无法生成节点地址。" >&2
-    return 1
-  fi
+  SELECTED_ENDPOINT_HOST=""
+  detect_public_ips true && detected=true
   if [[ -n "$DETECTED_PUBLIC_IPV4" && -n "$DETECTED_PUBLIC_IPV6" ]]; then
-    printf "请选择 %s 节点 IP 类型：\n1. IPv4  %s\n2. IPv6  %s\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
+    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 检测到的 IPv6  %s\n3. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
+    while true; do
+      safe_read "请选择 [1-3]: " choice
+      case "$choice" in
+        1) SELECTED_IP_VERSION=ipv4; return 0 ;;
+        2) SELECTED_IP_VERSION=ipv6; return 0 ;;
+        3) break ;;
+        *) warn "请输入 1-3 的数字。" >&2 ;;
+      esac
+    done
+  elif [[ -n "$DETECTED_PUBLIC_IPV4" ]]; then
+    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV4" >&2
     while true; do
       safe_read "请选择 [1-2]: " choice
       case "$choice" in
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
-        2) SELECTED_IP_VERSION=ipv6; return 0 ;;
+        2) break ;;
         *) warn "请输入 1-2 的数字。" >&2 ;;
       esac
     done
-  elif [[ -n "$DETECTED_PUBLIC_IPV4" ]]; then
-    SELECTED_IP_VERSION=ipv4
-    info "$label 自动使用 IPv4：$DETECTED_PUBLIC_IPV4" >&2
-  else
-    SELECTED_IP_VERSION=ipv6
-    info "$label 自动使用 IPv6：$DETECTED_PUBLIC_IPV6" >&2
+  elif [[ -n "$DETECTED_PUBLIC_IPV6" ]]; then
+    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv6  %s\n2. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV6" >&2
+    while true; do
+      safe_read "请选择 [1-2]: " choice
+      case "$choice" in
+        1) SELECTED_IP_VERSION=ipv6; return 0 ;;
+        2) break ;;
+        *) warn "请输入 1-2 的数字。" >&2 ;;
+      esac
+    done
+  elif [[ "$detected" == "false" ]]; then
+    warn "未检测到可用的公网 IPv4 或 IPv6，请手动输入客户端连接地址。" >&2
   fi
+  while true; do
+    safe_read "请输入客户端连接 IPv4、IPv6 或域名: " input
+    if SELECTED_ENDPOINT_HOST="$(endpoint_host_value "$input")"; then
+      SELECTED_IP_VERSION=custom
+      return 0
+    fi
+    warn "地址格式错误，请输入 IPv4、IPv6 或域名，不要包含协议、端口或路径。" >&2
+  done
 }
 
 select_protocol_hosts() {
-  local proto="$1" version
-  detect_public_ips || {
-    fail "未检测到可用的公网 IPv4 或 IPv6，无法生成节点地址。" >&2
-    return 1
-  }
-  version="$(proto_value "$proto" ip_version auto)"
-  case "$version" in
-    ipv4)
-      [[ -n "$DETECTED_PUBLIC_IPV4" ]] || {
-        fail "$proto 已选择 IPv4，但当前未检测到公网 IPv4。" >&2
-        return 1
-      }
-      PROTOCOL_HOST="$DETECTED_PUBLIC_IPV4"
-      ;;
-    ipv6)
-      [[ -n "$DETECTED_PUBLIC_IPV6" ]] || {
-        fail "$proto 已选择 IPv6，但当前未检测到公网 IPv6。" >&2
-        return 1
-      }
-      PROTOCOL_HOST="$DETECTED_PUBLIC_IPV6"
-      ;;
-    *)
-      PROTOCOL_HOST="${DETECTED_PUBLIC_IPV4:-$DETECTED_PUBLIC_IPV6}"
-      ;;
-  esac
+  local proto="$1" version endpoint_host
+  endpoint_host="$(proto_value "$proto" endpoint_host "")"
+  if [[ -n "$endpoint_host" ]]; then
+    PROTOCOL_HOST="$endpoint_host"
+  else
+    detect_public_ips || {
+      fail "未检测到可用的公网 IPv4 或 IPv6，无法生成节点地址。" >&2
+      return 1
+    }
+    version="$(proto_value "$proto" ip_version auto)"
+    case "$version" in
+      ipv4)
+        [[ -n "$DETECTED_PUBLIC_IPV4" ]] || {
+          fail "$proto 已选择 IPv4，但当前未检测到公网 IPv4。" >&2
+          return 1
+        }
+        PROTOCOL_HOST="$DETECTED_PUBLIC_IPV4"
+        ;;
+      ipv6)
+        [[ -n "$DETECTED_PUBLIC_IPV6" ]] || {
+          fail "$proto 已选择 IPv6，但当前未检测到公网 IPv6。" >&2
+          return 1
+        }
+        PROTOCOL_HOST="$DETECTED_PUBLIC_IPV6"
+        ;;
+      *)
+        PROTOCOL_HOST="${DETECTED_PUBLIC_IPV4:-$DETECTED_PUBLIC_IPV6}"
+        ;;
+    esac
+  fi
   if [[ "$PROTOCOL_HOST" == *:* ]]; then
     PROTOCOL_URL_HOST="[$PROTOCOL_HOST]"
   else
@@ -1257,6 +1304,9 @@ validate_protocol_hosts() {
 }
 
 proto_ip_label() {
+  local endpoint_host
+  endpoint_host="$(proto_value "$1" endpoint_host "")"
+  [[ -n "$endpoint_host" ]] && { printf '自定义:%s' "$endpoint_host"; return; }
   case "$(proto_value "$1" ip_version auto)" in
     ipv4) printf 'IPv4' ;;
     ipv6) printf 'IPv6' ;;
@@ -1264,11 +1314,35 @@ proto_ip_label() {
   esac
 }
 
+protocols_require_detected_host() {
+  local proto
+  for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http; do
+    if protocol_exists "$proto" && [[ -z "$(proto_value "$proto" endpoint_host "")" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+shared_custom_endpoint_host() {
+  local proto host shared=""
+  for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http; do
+    protocol_exists "$proto" || continue
+    host="$(proto_value "$proto" endpoint_host "")"
+    [[ -n "$host" ]] || return 1
+    [[ -z "$shared" || "$shared" == "$host" ]] || return 1
+    shared="$host"
+  done
+  [[ -n "$shared" ]] && printf '%s' "$shared"
+}
+
 server_host() {
-  local ip
-  ip="$(public_ipv4)"
-  [[ -n "$ip" ]] || ip="$(public_ipv6)"
-  printf '%s' "${ip:-未知地址}"
+  local host
+  host="$(state_value sub_endpoint_host "")"
+  [[ -n "$host" ]] || host="$(shared_custom_endpoint_host || true)"
+  [[ -n "$host" ]] || host="$(public_ipv4)"
+  [[ -n "$host" ]] || host="$(public_ipv6)"
+  printf '%s' "${host:-未知地址}"
 }
 
 server_url_host() {
@@ -1438,10 +1512,11 @@ generate_subscription() {
   ensure_state
   ensure_dirs
   local token raw v2rayn_raw sub_file ipv4 ipv6 pin
-  detect_public_ips || {
+  detect_public_ips || true
+  if protocols_require_detected_host && [[ -z "$DETECTED_PUBLIC_IPV4" && -z "$DETECTED_PUBLIC_IPV6" ]]; then
     fail "未检测到可用的公网 IPv4 或 IPv6，无法生成订阅。"
     return 1
-  }
+  fi
   validate_protocol_hosts || return 1
   token="$(state_value token)"
   ipv4="$DETECTED_PUBLIC_IPV4"
@@ -1486,6 +1561,9 @@ def val(name, key, default=""):
     return protos.get(name, {}).get(key, default)
 
 def host_for(name):
+    endpoint_host = val(name, "endpoint_host", "")
+    if endpoint_host:
+        return endpoint_host
     version = val(name, "ip_version", "auto")
     if version == "ipv4":
         if not ipv4:
@@ -2166,7 +2244,7 @@ add_mixed() {
   port="$(ask_port "Mixed" 30000)"
   username="$(ask_text "Mixed 用户名" "daimon")"
   password="$(ask_text "Mixed 密码" "daimon")"
-  set_protocol mixed "port=$port" "username=$username" "password=$password" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol mixed "port=$port" "username=$username" "password=$password"
   rebuild_configs
 }
 
@@ -2185,7 +2263,7 @@ add_vless_reality() {
     fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
     return 1
   fi
-  set_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key"
   rebuild_configs
 }
 
@@ -2195,7 +2273,7 @@ add_vmess_ws() {
   port="$(ask_port "Vmess-ws" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-ws UUID" "$(rand_uuid)")"
   ask_yes_no "是否开启 VMess-WS TLS？" n && tls=true || tls=false
-  set_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls"
   rebuild_configs
 }
 
@@ -2206,7 +2284,7 @@ add_hysteria2() {
   password="$(ask_text "Hysteria-2 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
   IFS=$'\t' read -r hop_start hop_end < <(ask_hopping "Hysteria-2")
-  set_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end"
   rebuild_configs
 }
 
@@ -2217,7 +2295,7 @@ add_tuic() {
   uuid="$(ask_text "Tuic-v5 UUID" "$(rand_uuid)")"
   password="$(ask_text "Tuic-v5 密码" "$uuid")"
   sni="$(pick_sni "$(random_sni)")"
-  set_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end=" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end="
   rebuild_configs
 }
 
@@ -2227,7 +2305,7 @@ add_anytls() {
   port="$(ask_port "Anytls" "$(random_free_port)")"
   password="$(ask_text "Anytls 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
-  set_protocol anytls "port=$port" "password=$password" "sni=$sni" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol anytls "port=$port" "password=$password" "sni=$sni"
   rebuild_configs
 }
 
@@ -2237,7 +2315,7 @@ add_trojan() {
   port="$(ask_port "Trojan" "$(random_free_port)")"
   password="$(ask_text "Trojan 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
-  set_protocol trojan "port=$port" "password=$password" "sni=$sni" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol trojan "port=$port" "password=$password" "sni=$sni"
   rebuild_configs
 }
 
@@ -2247,7 +2325,7 @@ add_shadowsocks() {
   port="$(ask_port "Shadowsocks" "$(random_free_port)")"
   password="$(ask_text "Shadowsocks 密码" "$(rand_uuid)")"
   method="$(ask_text "Shadowsocks 加密方式" "aes-128-gcm")"
-  set_protocol shadowsocks "port=$port" "password=$password" "method=$method" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol shadowsocks "port=$port" "password=$password" "method=$method"
   rebuild_configs
 }
 
@@ -2256,7 +2334,7 @@ add_vmess_tcp() {
   choose_node_ip_version "Vmess-tcp" || return 1
   port="$(ask_port "Vmess-tcp" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-tcp UUID" "$(rand_uuid)")"
-  set_protocol vmess_tcp "port=$port" "uuid=$uuid" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol vmess_tcp "port=$port" "uuid=$uuid"
   rebuild_configs
 }
 
@@ -2268,7 +2346,7 @@ add_vmess_http() {
   host="$(pick_sni "$(random_sni)")"
   path="$(ask_text "Vmess-http 路径" "/vmess-http")"
   [[ "$path" == /* ]] || path="/$path"
-  set_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path" "ip_version=$SELECTED_IP_VERSION"
+  set_selected_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path"
   rebuild_configs
 }
 
@@ -2283,23 +2361,23 @@ add_all_protocols() {
     fi
   done
   [[ "$needs_ip" == "false" ]] || choose_node_ip_version "一键添加协议" || return 1
-  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon" "ip_version=$SELECTED_IP_VERSION"
+  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon"
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] || {
     local keys private_key public_key
     keys="$(reality_keypair || true)"
     private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
     public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
     [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"; return 1; }
-    set_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key" "ip_version=$SELECTED_IP_VERSION"
+    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key"
   }
-  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false" "ip_version=$SELECTED_IP_VERSION"
-  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end=" "ip_version=$SELECTED_IP_VERSION"
+  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_selected_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false"
+  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_selected_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end="
   if [[ "$(proto_value tuic enabled false)" != "true" ]]; then
     local tuic_uuid
     tuic_uuid="$(rand_uuid)"
-    set_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end=" "ip_version=$SELECTED_IP_VERSION"
+    set_selected_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end="
   fi
-  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "ip_version=$SELECTED_IP_VERSION"
+  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_selected_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)"
   rebuild_configs
   info "一键协议已生成。"
   show_protocol_details
@@ -2458,7 +2536,7 @@ add_protocol_menu() {
 change_protocol_ip_version() {
   local proto="$1" label="$2"
   choose_node_ip_version "$label" || return 1
-  set_protocol "$proto" "ip_version=$SELECTED_IP_VERSION"
+  set_protocol "$proto" "ip_version=$SELECTED_IP_VERSION" "endpoint_host=$SELECTED_ENDPOINT_HOST"
 }
 
 change_protocol_config() {
@@ -2484,7 +2562,7 @@ change_protocol_config() {
   protocol_exists "$proto" || { warn "$label 尚未添加。"; return 0; }
   case "$proto" in
     mixed)
-      printf "1. 修改端口\n2. 修改用户名\n3. 修改密码\n4. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改用户名\n3. 修改密码\n4. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(proto_value mixed port 30000)" "$(proto_value mixed port)")"; set_protocol mixed "port=$port" ;;
@@ -2495,7 +2573,7 @@ change_protocol_config() {
       esac
       ;;
     vless_reality)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 重新生成 Reality 密钥\n5. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 重新生成 Reality 密钥\n5. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vless_reality port)")" "$(proto_value vless_reality port)")"; set_protocol vless_reality "port=$port" ;;
@@ -2514,7 +2592,7 @@ change_protocol_config() {
       esac
       ;;
     vmess_ws)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 开关 TLS\n4. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 开关 TLS\n4. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_ws port)")" "$(proto_value vmess_ws port)")"; set_protocol vmess_ws "port=$port" ;;
@@ -2525,7 +2603,7 @@ change_protocol_config() {
       esac
       ;;
     hysteria2)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 设置跳跃端口\n5. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 设置跳跃端口\n5. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value hysteria2 port)")" "$(proto_value hysteria2 port)")"; set_protocol hysteria2 "port=$port" ;;
@@ -2537,7 +2615,7 @@ change_protocol_config() {
       esac
       ;;
     tuic)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改密码\n4. 修改 SNI\n5. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改密码\n4. 修改 SNI\n5. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value tuic port)")" "$(proto_value tuic port)")"; set_protocol tuic "port=$port" ;;
@@ -2549,7 +2627,7 @@ change_protocol_config() {
       esac
       ;;
     anytls)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value anytls port)")" "$(proto_value anytls port)")"; set_protocol anytls "port=$port" ;;
@@ -2560,7 +2638,7 @@ change_protocol_config() {
       esac
       ;;
     trojan)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value trojan port)")" "$(proto_value trojan port)")"; set_protocol trojan "port=$port" ;;
@@ -2571,7 +2649,7 @@ change_protocol_config() {
       esac
       ;;
     shadowsocks)
-      printf "1. 修改端口\n2. 修改密码\n3. 修改加密方式\n4. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改密码\n3. 修改加密方式\n4. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 4)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value shadowsocks port)")" "$(proto_value shadowsocks port)")"; set_protocol shadowsocks "port=$port" ;;
@@ -2582,7 +2660,7 @@ change_protocol_config() {
       esac
       ;;
     vmess_tcp)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 3)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_tcp port)")" "$(proto_value vmess_tcp port)")"; set_protocol vmess_tcp "port=$port" ;;
@@ -2592,7 +2670,7 @@ change_protocol_config() {
       esac
       ;;
     vmess_http)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 Host\n4. 修改路径\n5. 修改节点 IP 类型\n0. 返回\n"
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 Host\n4. 修改路径\n5. 修改客户端连接地址\n0. 返回\n"
       field="$(ask_menu "请选择: " 5)"
       case "$field" in
         1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_http port)")" "$(proto_value vmess_http port)")"; set_protocol vmess_http "port=$port" ;;
@@ -2613,14 +2691,15 @@ change_protocol_config() {
 
 change_subscription_config() {
   ensure_state
-  local choice old_port new_port old_token new_token input domain
+  local choice old_port new_port old_token new_token input domain endpoint_host
   title "更改综合订阅配置"
-  printf "当前订阅端口:%s\n当前订阅token:%s\n当前HTTPS订阅域名:%s\nHTTPS状态:%s\n\n" \
-    "$(state_value sub_port 2096)" "$(state_value token)" "$(state_value sub_domain "未设置")" \
+  endpoint_host="$(state_value sub_endpoint_host "")"
+  printf "当前订阅端口:%s\nHTTP/IP订阅连接地址:%s\n当前订阅token:%s\n当前HTTPS订阅域名:%s\nHTTPS状态:%s\n\n" \
+    "$(state_value sub_port 2096)" "${endpoint_host:-自动}" "$(state_value token)" "$(state_value sub_domain "未设置")" \
     "$([[ "$(state_value sub_tls false)" == "true" ]] && printf '已配置' || printf '未配置')"
   show_subscription_links
-  printf "\n1. 修改综合订阅端口\n2. 指定或重新生成 token\n3. 设置/更改 HTTPS 订阅域名\n4. 删除 HTTPS 订阅域名配置\n0. 返回\n"
-  choice="$(ask_menu "请选择: " 4)"
+  printf "\n1. 修改综合订阅端口\n2. 指定或重新生成 token\n3. 设置/更改 HTTPS 订阅域名\n4. 删除 HTTPS 订阅域名配置\n5. 修改 HTTP/IP 订阅连接地址\n0. 返回\n"
+  choice="$(ask_menu "请选择: " 5)"
   case "$choice" in
     1)
       old_port="$(state_value sub_port 2096)"
@@ -2666,6 +2745,22 @@ change_subscription_config() {
     4)
       ask_yes_no "确认删除 HTTPS 订阅域名配置、nginx 反代和该域名证书？" n || return 1
       delete_https_subscription_domain
+      ;;
+    5)
+      while true; do
+        safe_read "请输入 HTTP/IP 订阅连接 IPv4、IPv6 或域名，直接回车恢复自动: " input
+        if [[ -z "$input" ]]; then
+          set_state_value sub_endpoint_host ""
+          info "HTTP/IP 订阅连接地址已恢复自动选择。"
+          return 0
+        fi
+        if endpoint_host="$(endpoint_host_value "$input")"; then
+          set_state_value sub_endpoint_host "$endpoint_host"
+          info "HTTP/IP 订阅连接地址已更新为 $endpoint_host。"
+          return 0
+        fi
+        warn "地址格式错误，请输入 IPv4、IPv6 或域名，不要包含协议、端口或路径。"
+      done
       ;;
     0) return 1 ;;
   esac
@@ -2757,7 +2852,7 @@ show_status_header() {
   active="$(sing_box_status)"
   printf "${CYAN}系统:${NC}%s  ${CYAN}内核:${NC}%s  ${CYAN}处理器:${NC}%s  ${CYAN}虚拟化:${NC}%s  ${CYAN}BBR算法:${NC}%s ${CYAN}队列算法:${NC}%s\n" "$os" "$kernel" "$arch" "$virt" "$bbr" "$qdisc"
   printf "%s\n" "$(version_status)"
-  printf "${CYAN}本地IPV4地址:${NC}${MAGENTA}%s${NC}   ${CYAN}本地IPV6地址:${NC}%b\n" "${ipv4:-无IPV4}" "$(color_status "${ipv6:-无IPV6}")"
+  printf "${CYAN}出口IPV4地址:${NC}${MAGENTA}%s${NC}   ${CYAN}出口IPV6地址:${NC}%b\n" "${ipv4:-无IPV4}" "$(color_status "${ipv6:-无IPV6}")"
   printf "${CYAN}服务器地区:${NC}${MAGENTA}%s${NC}\n" "${region:-未知}"
   printf "%s\n" "$(ufw_status_text)"
   printf "${CYAN}Sing-box状态:${NC}%b\n\n" "$(color_status "$active")"
@@ -2886,4 +2981,6 @@ main_menu() {
   done
 }
 
-main_menu
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main_menu
+fi
