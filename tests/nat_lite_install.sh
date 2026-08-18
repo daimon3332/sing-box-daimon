@@ -33,6 +33,7 @@ INPUTS=(nat.example.com)
 SAFE_READ_COUNT=0
 DEPENDENCY_MODE=""
 DEPENDENCIES_READY=false
+DOWNLOAD_MODE=""
 
 python3() {
   [[ "$DEPENDENCIES_READY" == "true" ]] || {
@@ -72,6 +73,7 @@ cert_pin_sha256() { printf 'certificate generation must not run\n' >&2; return 1
 show_qr() { printf 'QR generation must not run\n' >&2; return 1; }
 
 download_core() {
+  DOWNLOAD_MODE="${1:-}"
   mkdir -p "$(dirname "$BIN")"
   printf '%s\n' '#!/usr/bin/env bash' 'exit 0' >"$BIN"
   chmod 0755 "$BIN"
@@ -84,6 +86,7 @@ systemctl() {
 install_nat_lite >/dev/null
 
 [[ "$DEPENDENCY_MODE" == "lite" ]]
+[[ "$DOWNLOAD_MODE" == "lite" ]]
 [[ "$SAFE_READ_COUNT" == "1" ]]
 [[ "$(state_value install_mode)" == "lite" ]]
 [[ "$(proto_value vless_reality enabled false)" == "true" ]]

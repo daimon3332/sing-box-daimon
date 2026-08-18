@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.5.0"
+SCRIPT_VERSION="1.5.1"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -1972,25 +1972,148 @@ restart_sub_service() {
   systemctl is-active --quiet sing-box-sub
 }
 
+lite_dependencies_ready() {
+  local cmd
+  for cmd in curl tar gzip python3 ss; do
+    has_cmd "$cmd" || return 1
+  done
+  [[ -s /etc/ssl/certs/ca-certificates.crt ]]
+}
+
+download_debian_lite_packages() {
+  local cache="$1" arch codename base index package filename checksum status target
+  arch="$(dpkg --print-architecture)"
+  codename="$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}")"
+  [[ -n "$arch" && -n "$codename" ]] || return 1
+  base="https://deb.debian.org/debian"
+  index="$cache/Packages.selected"
+  if ! curl -fLsS --limit-rate 2M "$base/dists/$codename/main/binary-$arch/Packages.gz" |
+    gzip -dc |
+    awk 'BEGIN { RS=""; ORS="\n\n" }
+      $0 ~ /^Package: (python3|python3-minimal|libpython3-stdlib|python3\.[0-9]+|python3\.[0-9]+-minimal|libpython3\.[0-9]+-minimal|libpython3\.[0-9]+-stdlib|libexpat1|libssl3t64|libssl3|media-types|netbase|tzdata|libbz2-1\.0|libc6|libdb5\.3t64|libdb5\.3|libffi8|liblzma5|libncursesw6|libreadline[0-9]+t64|libreadline[0-9]+|libsqlite3-0|libtinfo6|libuuid1|zlib1g|readline-common|dpkg)\n/ { print }
+    ' >"$index"; then
+    return 1
+  fi
+  grep -q '^Package: python3$' "$index" || return 1
+  while IFS=$'\t' read -r package filename checksum; do
+    [[ -n "$package" && -n "$filename" && -n "$checksum" ]] || continue
+    status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)"
+    [[ "$status" == ii* ]] && continue
+    target="$cache/${filename##*/}"
+    curl -fLsS --limit-rate 1M "$base/$filename" -o "$target" || return 1
+    printf '%s  %s\n' "$checksum" "$target" | sha256sum -c - >/dev/null 2>&1 || return 1
+    sync
+  done < <(awk 'BEGIN { RS=""; FS="\n"; OFS="\t" }
+    {
+      package=filename=checksum=""
+      for (i=1; i<=NF; i++) {
+        if ($i ~ /^Package: /) package=substr($i, 10)
+        else if ($i ~ /^Filename: /) filename=substr($i, 11)
+        else if ($i ~ /^SHA256: /) checksum=substr($i, 9)
+      }
+      if (package && filename && checksum) print package, filename, checksum
+    }
+  ' "$index")
+  rm -f "$index"
+}
+
+download_apt_lite_packages() {
+  local cache="$1"
+  shift
+  DEBIAN_FRONTEND=noninteractive apt-get \
+    -o "Dir::Cache::archives=$cache/" \
+    -o APT::Install-Recommends=false \
+    -o APT::Install-Suggests=false \
+    install -y --download-only "$@"
+}
+
+install_apt_lite_dependencies() {
+  local cache stale deb package status attempt audit os_id
+  local packages=(curl tar gzip python3 iproute2 ca-certificates)
+  local debs=()
+  mkdir -p "$ROOT"
+  audit="$(dpkg --audit 2>/dev/null || true)"
+  [[ -z "$audit" ]] || {
+    fail "dpkg 存在未完成事务，请先执行 dpkg --configure -a。"
+    return 1
+  }
+  while IFS= read -r stale; do
+    [[ "$stale" == "$ROOT"/.packages.* ]] && rm -rf -- "$stale"
+  done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '.packages.*' -print 2>/dev/null)
+  cache="$(mktemp -d "$ROOT/.packages.XXXXXX")" || {
+    fail "无法创建依赖下载目录。"
+    return 1
+  }
+  mkdir -p "$cache/partial"
+  info "正在以低内存方式下载 NAT 必需依赖..."
+  os_id=""
+  [[ ! -r /etc/os-release ]] || os_id="$(. /etc/os-release; printf '%s' "${ID:-}")"
+  if [[ "$os_id" == "debian" ]]; then
+    download_debian_lite_packages "$cache" || {
+      rm -rf -- "$cache"
+      fail "Debian 轻量依赖下载或校验失败。"
+      return 1
+    }
+  elif ! download_apt_lite_packages "$cache" "${packages[@]}"; then
+    rm -rf -- "$cache"
+    fail "低内存依赖下载失败。请确认系统已有可用的软件包索引。"
+    return 1
+  fi
+  mapfile -t debs < <(find "$cache" -maxdepth 1 -type f -name '*.deb' -print | sort)
+  for ((attempt = 0; attempt <= ${#debs[@]}; attempt++)); do
+    for deb in "${debs[@]}"; do
+      package="$(dpkg-deb -f "$deb" Package 2>/dev/null || true)"
+      [[ -n "$package" ]] || continue
+      status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)"
+      [[ "$status" == ii* ]] && continue
+      dpkg -i "$deb" >/dev/null 2>&1 || true
+    done
+    dpkg --configure -a >/dev/null 2>&1 || true
+    if lite_dependencies_ready && [[ -z "$(dpkg --audit 2>/dev/null || true)" ]]; then
+      rm -rf -- "$cache"
+      info "NAT 轻量依赖已安装。"
+      return 0
+    fi
+  done
+  rm -rf -- "$cache"
+  fail "NAT 轻量依赖安装不完整。"
+  return 1
+}
+
 install_dependencies() {
   local mode="${1:-standard}"
-  local packages="curl tar gzip python3 iproute2 ca-certificates"
-  local rpm_packages="curl tar gzip python3 iproute ca-certificates"
-  [[ "$mode" == "standard" ]] && packages="$packages openssl qrencode"
-  [[ "$mode" == "standard" ]] && rpm_packages="$rpm_packages openssl qrencode"
+  local packages=(curl tar gzip python3 iproute2 ca-certificates openssl qrencode)
+  local rpm_packages=(curl tar gzip python3 iproute ca-certificates openssl qrencode)
+  if [[ "$mode" == "lite" ]]; then
+    if lite_dependencies_ready; then
+      info "NAT 必需依赖已齐全，跳过包管理器。"
+      return 0
+    fi
+    if has_cmd apt-get; then
+      install_apt_lite_dependencies || return 1
+    elif has_cmd dnf; then
+      dnf install -y --setopt=install_weak_deps=False "${rpm_packages[@]:0:6}"
+    elif has_cmd yum; then
+      yum install -y "${rpm_packages[@]:0:6}"
+    else
+      fail "缺少 NAT 必需依赖，且未识别可用的包管理器。"
+      return 1
+    fi
+    lite_dependencies_ready || {
+      fail "NAT 必需依赖仍不完整。"
+      return 1
+    }
+    return 0
+  fi
   if has_cmd apt-get; then
     apt-get update
-    apt-get install -y $packages
+    apt-get install -y "${packages[@]}"
   elif has_cmd dnf; then
-    dnf install -y $rpm_packages
+    dnf install -y "${rpm_packages[@]}"
   elif has_cmd yum; then
-    yum install -y $rpm_packages
+    yum install -y "${rpm_packages[@]}"
   else
-    if [[ "$mode" == "standard" ]]; then
-      warn "未识别包管理器，请确保 curl、tar、gzip、openssl、python3、ss、qrencode 已安装。"
-    else
-      warn "未识别包管理器，请确保 curl、tar、gzip、python3、ss 已安装。"
-    fi
+    warn "未识别包管理器，请确保 curl、tar、gzip、openssl、python3、ss、qrencode 已安装。"
   fi
 }
 
@@ -2217,8 +2340,11 @@ arch_name() {
 }
 
 download_core() {
-  local arch url tmp file lib
+  local mode="${1:-standard}" arch url tmp file lib stale
   arch="$(arch_name)"
+  while IFS= read -r stale; do
+    [[ "$stale" == "$ROOT"/.download.* ]] && rm -rf -- "$stale"
+  done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '.download.*' -print 2>/dev/null)
   tmp="$(mktemp -d "$ROOT/.download.XXXXXX")" || {
     fail "无法创建 sing-box 下载目录。"
     return 1
@@ -2234,15 +2360,25 @@ download_core() {
     fail "未找到 sing-box 下载地址。"
     return 1
   fi
-  if ! curl -fL "$url" -o "$tmp/sing-box.tar.gz"; then
-    rm -rf "$tmp"
-    fail "sing-box 内核下载失败。"
-    return 1
-  fi
-  if ! tar -xzf "$tmp/sing-box.tar.gz" -C "$tmp"; then
-    rm -rf "$tmp"
-    fail "sing-box 内核解压失败。"
-    return 1
+  if [[ "$mode" == "lite" ]]; then
+    info "正在以最低内存方式流式安装 sing-box 内核..."
+    if ! curl -fLsS --limit-rate 1M "$url" |
+      tar --checkpoint=100 --checkpoint-action=exec='sync' -xzf - -C "$tmp" --wildcards '*/sing-box'; then
+      rm -rf -- "$tmp"
+      fail "sing-box 内核流式下载或解压失败。"
+      return 1
+    fi
+  else
+    if ! curl -fL "$url" -o "$tmp/sing-box.tar.gz"; then
+      rm -rf -- "$tmp"
+      fail "sing-box 内核下载失败。"
+      return 1
+    fi
+    if ! tar -xzf "$tmp/sing-box.tar.gz" -C "$tmp"; then
+      rm -rf -- "$tmp"
+      fail "sing-box 内核解压失败。"
+      return 1
+    fi
   fi
   file="$(find "$tmp" -type f -name sing-box | head -n1)"
   if [[ -z "$file" ]]; then
@@ -2251,8 +2387,9 @@ download_core() {
     return 1
   fi
   lib="$(find "$tmp" -type f -name libcronet.so | head -n1)"
-  rm -f "$tmp/sing-box.tar.gz"
+  [[ "$mode" == "lite" ]] || rm -f "$tmp/sing-box.tar.gz"
   sync
+  [[ "$mode" == "lite" ]] && sleep 1
   if ! chmod 0755 "$file"; then
     rm -rf "$tmp"
     fail "无法设置 sing-box 内核执行权限。"
@@ -2460,7 +2597,7 @@ install_sing_box() {
   ensure_dirs
   ensure_state
   set_state_value install_mode standard
-  download_core
+  download_core standard
   ensure_cert
   write_base_configs
   write_sub_server
@@ -2491,9 +2628,9 @@ install_nat_lite() {
     fail "NAT 轻量安装只接受尚未添加协议的状态，请先使用标准模式或清理现有协议。"
     return 1
   }
-  set_state_value install_mode lite
   ensure_dirs
-  download_core || return 1
+  download_core lite || return 1
+  set_state_value install_mode lite
   write_base_configs
   write_services lite
   install_shortcuts
