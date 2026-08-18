@@ -23,6 +23,15 @@ sb
 sing-box
 ```
 
+安装菜单提供两种模式：
+
+- `3. 标准安装 Sing-box`：安装完整协议管理、二维码和 HTTP/HTTPS 订阅能力。
+- `13. NAT 轻量安装：仅 Vless-reality`：面向 128 MB 等低内存 NAT 容器，只运行 VLESS Reality。
+
+NAT 轻量安装只询问一次客户端连接 IPv4、IPv6 或域名；监听端口自动生成，不询问外部端口。请在 NAT 服务商面板把显示的端口映射到相同内部端口。该模式不安装 OpenSSL、qrencode、自签证书或 Python 订阅进程，也不提供 HTTP/HTTPS 订阅和二维码，只显示可直接导入客户端的 VLESS 链接。需要完整功能时再次运行脚本并选择菜单 `3`，即可按原状态升级为标准模式。
+
+sing-box 发布包解压后的内核约为数十 MB。脚本会在 `/etc/sing-box` 同一文件系统解压，删除压缩包并验证候选内核后原子替换，避免旧流程复制大文件时在低内存容器内产生额外峰值。
+
 手动彻底删除脚本、sing-box、节点、订阅服务、脚本托管的 UFW 规则和跳跃端口转发：
 
 ```bash
@@ -76,8 +85,8 @@ curl -x 'socks5://daimon:daimon@IP:30000' https://ip.sb
 
 ```text
 1. 更新脚本
-3. 一键安装 Sing-box
-6. 一键添加协议
+3. 标准安装 Sing-box
+6. 一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls
 ```
 
 记录菜单里展示的 `IP`、`token`、各协议端口。下面示例变量按实际值替换：
@@ -112,7 +121,7 @@ ufw status
 - SOCKS5 curl 返回服务器出口 IP
 - UFW inactive 时无需放行；UFW active 时状态页不能出现缺失端口
 
-HTTPS 订阅域名测试。先在菜单 `10. 更改综合订阅配置` 里选择 `3. 设置/更改 HTTPS 订阅域名`，输入已解析到本机 IP 的域名，例如：
+HTTPS 订阅域名测试。先在菜单 `11. 更改综合订阅配置` 里选择 `3. 设置/更改 HTTPS 订阅域名`，输入已解析到本机 IP 的域名，例如：
 
 ```text
 sing-box-hk.333186.xyz
@@ -257,7 +266,7 @@ D:\v2rayN-windows-64\bin\sing_box\sing-box.exe version
 
 ## 订阅形式
 
-订阅服务默认端口为 `2096`，token 随机生成且只包含字母和数字。可以在菜单 `10. 更改综合订阅配置` 中修改订阅端口、指定 token 或回车随机重生成 token。
+标准模式的订阅服务默认端口为 `2096`，token 随机生成且只包含字母和数字。可以在菜单 `11. 更改综合订阅配置` 中修改订阅端口、指定 token 或回车随机重生成 token。NAT 轻量模式不启动订阅服务。
 
 ```text
 http://IP:2096/sub/token          # 默认订阅：v2rayN Base64
@@ -308,12 +317,14 @@ http://IP:2096/sub/token/mihomo
 `sb.sh` 是自定义 sing-box 管理脚本，使用官方 sing-box 内核和 `/etc/sing-box/conf/*.json` 拆分配置。
 
 - 快捷命令：安装后支持 `sb` 和 `sing-box` 进入管理菜单
-- 安装管理：一键安装、删除卸载、更新脚本、删除脚本
+- 安装管理：标准安装、NAT 轻量 VLESS Reality 安装、删除卸载、更新脚本、删除脚本
 - 状态页：脚本版本、最新状态、UFW 状态、缺失端口、系统、内核、架构、虚拟化、BBR、IP、地区、服务状态
 - 协议管理：Mixed、VLESS Reality、VMess WS、Hysteria2、TUIC v5、AnyTLS、Trojan、Shadowsocks、VMess TCP、VMess HTTP
 - 一键添加协议：一次生成 Mixed / VLESS Reality / VMess WS / Hysteria2 / TUIC v5 / AnyTLS
 - 添加协议时自动检测公网 IPv4/IPv6：可使用检测地址，也可手动输入客户端连接地址
 - 一键添加协议只询问一次客户端连接地址，并应用到本次新建的全部默认协议
+- NAT 轻量安装只生成 VLESS Reality，一次选择客户端连接地址并自动生成监听端口和认证参数
+- NAT 轻量模式不安装 OpenSSL、qrencode、自签证书或订阅进程，可通过标准安装原地升级
 - 添加协议时支持放弃自动检测，手动输入客户端连接 IPv4、IPv6 或域名，适配 NAT 入口地址
 - NAT 模式节点端口继续使用内部监听端口，外部相同端口映射由用户在 NAT 服务商页面配置
 - 每个协议独立保存客户端连接地址，可在修改协议菜单中切换；不限制 VPS 的 Direct 出站
@@ -340,7 +351,7 @@ http://IP:2096/sub/token/mihomo
 
 ## 运行目录
 
-脚本在 VPS 上运行后使用以下路径：
+标准模式在 VPS 上运行后使用以下路径：
 
 ```text
 /etc/sing-box/
@@ -358,5 +369,7 @@ http://IP:2096/sub/token/mihomo
 /etc/systemd/system/sing-box.service
 /etc/systemd/system/sing-box-sub.service
 ```
+
+NAT 轻量模式保留 `bin/sing-box`、VLESS 配置、状态文件、管理脚本和 `sing-box.service`，不会创建证书文件、`sub_server.py` 或 `sing-box-sub.service`。
 
 本仓库只保存管理脚本、README 和计划文件；实际安装和运行文件由脚本在 VPS 上创建。

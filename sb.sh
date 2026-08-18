@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -79,7 +79,10 @@ has_cmd() {
 }
 
 rand_hex() {
-  openssl rand -hex "${1:-16}"
+  python3 - "${1:-16}" <<'PY'
+import secrets, sys
+print(secrets.token_hex(int(sys.argv[1])))
+PY
 }
 
 rand_b64() {
@@ -192,6 +195,7 @@ state = {
   "sub_endpoint_host": "",
   "sub_domain": "",
   "sub_tls": False,
+  "install_mode": "standard",
   "protocols": {}
 }
 with open(sys.argv[1], "w", encoding="utf-8") as f:
@@ -250,6 +254,14 @@ PY
 proto_value() {
   local proto="$1" key="$2" default="${3:-}"
   state_value "protocols.$proto.$key" "$default"
+}
+
+install_mode() {
+  state_value install_mode standard
+}
+
+lite_mode() {
+  [[ "$(install_mode)" == "lite" ]]
 }
 
 set_state_value() {
@@ -442,7 +454,7 @@ protocol_ufw_rules() {
 
 required_ufw_rules() {
   local sub_port
-  if [[ -f "$SUB_SERVICE" || -x "$BIN" || -f "$SUB_SERVER" ]]; then
+  if [[ -f "$SUB_SERVICE" || -f "$SUB_SERVER" ]]; then
     sub_port="$(state_value sub_port 2096)"
     [[ -n "$sub_port" ]] && printf '%s/tcp\n' "$sub_port"
   fi
@@ -1324,6 +1336,16 @@ protocols_require_detected_host() {
   return 1
 }
 
+protocols_require_certificate() {
+  local proto
+  for proto in hysteria2 tuic anytls trojan; do
+    if [[ "$(proto_value "$proto" enabled false)" == "true" ]]; then
+      return 0
+    fi
+  done
+  [[ "$(proto_value vmess_ws enabled false)" == "true" && "$(proto_value vmess_ws tls false)" == "true" ]]
+}
+
 shared_custom_endpoint_host() {
   local proto host shared=""
   for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http; do
@@ -1521,7 +1543,8 @@ generate_subscription() {
   token="$(state_value token)"
   ipv4="$DETECTED_PUBLIC_IPV4"
   ipv6="$DETECTED_PUBLIC_IPV6"
-  pin="$(cert_pin_sha256)"
+  pin=""
+  protocols_require_certificate && pin="$(cert_pin_sha256)"
   raw="$SUB/raw.txt"
   v2rayn_raw="$SUB/v2rayn_raw.txt"
   sub_file="$SUB/sub.txt"
@@ -1812,13 +1835,13 @@ show_qr() {
 }
 
 show_protocol_links() {
-  local label link found=0
+  local show_qr_codes="${1:-true}" label link found=0
   while IFS=$'\t' read -r label link; do
     [[ -n "${link:-}" ]] || continue
     found=1
     title "【 $label 】"
     printf "${MAGENTA}%s${NC}\n" "$link"
-    show_qr "$link"
+    [[ "$show_qr_codes" == "true" ]] && show_qr "$link"
     printf "\n"
   done < <(protocol_link_rows)
   (( found == 1 )) || printf "暂无协议链接。\n\n"
@@ -1900,6 +1923,7 @@ write_managed_script() {
 }
 
 write_services() {
+  local mode="${1:-standard}"
   cat >"$SERVICE" <<EOF
 [Unit]
 Description=sing-box service
@@ -1911,13 +1935,12 @@ ExecStart=$BIN run -C $CONF
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
-AmbientCapabilities=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
-CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_NET_RAW
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  cat >"$SUB_SERVICE" <<EOF
+  if [[ "$mode" == "standard" ]]; then
+    cat >"$SUB_SERVICE" <<EOF
 [Unit]
 Description=sing-box daimon subscription service
 After=network-online.target
@@ -1931,6 +1954,10 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
+  else
+    systemctl disable --now sing-box-sub >/dev/null 2>&1 || true
+    rm -f "$SUB_SERVICE" "$SUB_SERVER"
+  fi
   systemctl daemon-reload
 }
 
@@ -1946,15 +1973,24 @@ restart_sub_service() {
 }
 
 install_dependencies() {
+  local mode="${1:-standard}"
+  local packages="curl tar gzip python3 iproute2 ca-certificates"
+  local rpm_packages="curl tar gzip python3 iproute ca-certificates"
+  [[ "$mode" == "standard" ]] && packages="$packages openssl qrencode"
+  [[ "$mode" == "standard" ]] && rpm_packages="$rpm_packages openssl qrencode"
   if has_cmd apt-get; then
     apt-get update
-    apt-get install -y curl tar gzip openssl python3 iproute2 ca-certificates qrencode
+    apt-get install -y $packages
   elif has_cmd dnf; then
-    dnf install -y curl tar gzip openssl python3 iproute ca-certificates qrencode
+    dnf install -y $rpm_packages
   elif has_cmd yum; then
-    yum install -y curl tar gzip openssl python3 iproute ca-certificates qrencode
+    yum install -y $rpm_packages
   else
-    warn "未识别包管理器，请确保 curl、tar、gzip、openssl、python3、ss、qrencode 已安装。"
+    if [[ "$mode" == "standard" ]]; then
+      warn "未识别包管理器，请确保 curl、tar、gzip、openssl、python3、ss、qrencode 已安装。"
+    else
+      warn "未识别包管理器，请确保 curl、tar、gzip、python3、ss 已安装。"
+    fi
   fi
 }
 
@@ -2181,36 +2217,67 @@ arch_name() {
 }
 
 download_core() {
-  local arch url tmp file
+  local arch url tmp file lib
   arch="$(arch_name)"
-  tmp="$(mktemp -d)"
+  tmp="$(mktemp -d "$ROOT/.download.XXXXXX")" || {
+    fail "无法创建 sing-box 下载目录。"
+    return 1
+  }
   url="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest |
     grep browser_download_url |
     grep "linux-$arch.tar.gz" |
     grep -v '\.asc' |
     head -n1 |
     cut -d '"' -f4)"
-  [[ -n "$url" ]] || { fail "未找到 sing-box 下载地址。"; return 1; }
-  curl -fL "$url" -o "$tmp/sing-box.tar.gz"
-  tar -xzf "$tmp/sing-box.tar.gz" -C "$tmp"
+  if [[ -z "$url" ]]; then
+    rm -rf "$tmp"
+    fail "未找到 sing-box 下载地址。"
+    return 1
+  fi
+  if ! curl -fL "$url" -o "$tmp/sing-box.tar.gz"; then
+    rm -rf "$tmp"
+    fail "sing-box 内核下载失败。"
+    return 1
+  fi
+  if ! tar -xzf "$tmp/sing-box.tar.gz" -C "$tmp"; then
+    rm -rf "$tmp"
+    fail "sing-box 内核解压失败。"
+    return 1
+  fi
   file="$(find "$tmp" -type f -name sing-box | head -n1)"
-  [[ -n "$file" ]] || { fail "压缩包内未找到 sing-box。"; return 1; }
-  install -m 0755 "$file" "$BIN"
-  if ! chmod 0755 "$BIN"; then
+  if [[ -z "$file" ]]; then
+    rm -rf "$tmp"
+    fail "压缩包内未找到 sing-box。"
+    return 1
+  fi
+  lib="$(find "$tmp" -type f -name libcronet.so | head -n1)"
+  rm -f "$tmp/sing-box.tar.gz"
+  sync
+  if ! chmod 0755 "$file"; then
     rm -rf "$tmp"
     fail "无法设置 sing-box 内核执行权限。"
     return 1
   fi
-  if [[ ! -x "$BIN" ]]; then
-    rm -rf "$tmp"
-    fail "sing-box 内核缺少执行权限。"
-    return 1
-  fi
-  if ! "$BIN" version >/dev/null 2>&1; then
+  if ! "$file" version >/dev/null 2>&1; then
     rm -rf "$tmp"
     fail "sing-box 内核无法执行，请检查文件权限或文件系统挂载选项。"
     return 1
   fi
+  if [[ -n "$lib" ]] && ! mv -f "$lib" "$ROOT/bin/libcronet.so"; then
+    rm -rf "$tmp"
+    fail "无法安装 sing-box 运行库。"
+    return 1
+  fi
+  if ! mv -f "$file" "$BIN"; then
+    rm -rf "$tmp"
+    fail "无法原子安装 sing-box 内核。"
+    return 1
+  fi
+  chmod 0755 "$BIN" || {
+    rm -rf "$tmp"
+    fail "无法设置 sing-box 内核执行权限。"
+    return 1
+  }
   rm -rf "$tmp"
 }
 
@@ -2353,6 +2420,10 @@ add_vmess_http() {
 add_all_protocols() {
   local proto needs_ip=false
   ensure_state
+  lite_mode && {
+    fail "NAT 轻量模式只支持 VLESS Reality；如需其他协议，请先执行标准安装升级。"
+    return 1
+  }
   require_core_installed || return 1
   for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls; do
     if ! protocol_exists "$proto"; then
@@ -2385,14 +2456,15 @@ add_all_protocols() {
 
 install_sing_box() {
   need_root
-  install_dependencies
+  install_dependencies standard
   ensure_dirs
   ensure_state
+  set_state_value install_mode standard
   download_core
   ensure_cert
   write_base_configs
   write_sub_server
-  write_services
+  write_services standard
   install_shortcuts
   sync_ufw_ports
   systemctl enable sing-box sing-box-sub >/dev/null 2>&1 || true
@@ -2405,6 +2477,53 @@ install_sing_box() {
     systemctl status sing-box --no-pager 2>/dev/null || true
     return 1
   fi
+}
+
+lite_state_is_fresh() {
+  ! has_protocols
+}
+
+install_nat_lite() {
+  need_root
+  install_dependencies lite
+  ensure_state
+  lite_state_is_fresh || {
+    fail "NAT 轻量安装只接受尚未添加协议的状态，请先使用标准模式或清理现有协议。"
+    return 1
+  }
+  set_state_value install_mode lite
+  ensure_dirs
+  download_core || return 1
+  write_base_configs
+  write_services lite
+  install_shortcuts
+  sync_ufw_ports
+  systemctl enable sing-box >/dev/null 2>&1 || true
+  choose_node_ip_version "NAT 轻量 VLESS" || return 1
+  local keys private_key public_key
+  keys="$(reality_keypair || true)"
+  private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
+  public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
+  [[ -n "$private_key" && -n "$public_key" ]] || {
+    fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
+    return 1
+  }
+  set_selected_protocol vless_reality \
+    "port=$(random_free_port)" \
+    "uuid=$(rand_uuid)" \
+    "sni=$(random_sni)" \
+    "short_id=$(rand_hex 8)" \
+    "private_key=$private_key" \
+    "public_key=$public_key"
+  rebuild_configs || return 1
+  if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box; then
+    info "NAT 轻量 VLESS Reality 已安装并运行。外部端口请在 NAT 页面映射为同一端口。"
+    show_protocol_details
+    return 0
+  fi
+  fail "NAT 轻量 VLESS Reality 已写入，但 Sing-box 启动失败。"
+  systemctl status sing-box --no-pager 2>/dev/null || true
+  return 1
 }
 
 uninstall_sing_box() {
@@ -2512,6 +2631,10 @@ restart_if_running() {
 
 add_protocol_menu() {
   require_core_installed || return 0
+  lite_mode && {
+    warn "NAT 轻量模式只运行已创建的 VLESS Reality；如需其他协议，请先执行标准安装升级。"
+    return 0
+  }
   title "添加协议"
   printf "1. Mixed\n2. Vless-reality\n3. Vmess-ws\n4. Hysteria-2\n5. Tuic-v5\n6. Anytls\n7. Trojan\n8. Shadowsocks\n9. Vmess-tcp\n10. Vmess-http\n0. 返回\n"
   case "$(ask_menu "请选择: " 10)" in
@@ -2691,6 +2814,10 @@ change_protocol_config() {
 
 change_subscription_config() {
   ensure_state
+  lite_mode && {
+    warn "NAT 轻量模式未启用 HTTP/HTTPS 订阅服务。"
+    return 0
+  }
   local choice old_port new_port old_token new_token input domain endpoint_host
   title "更改综合订阅配置"
   endpoint_host="$(state_value sub_endpoint_host "")"
@@ -2863,8 +2990,12 @@ show_protocols() {
   if ! has_protocols; then
     if [[ -s "$STATE" ]]; then
       printf "暂无协议。\n\n"
-      show_subscription_links
-      printf "\n"
+      if lite_mode; then
+        printf "NAT 轻量模式未启用 HTTP/HTTPS 订阅服务。\n\n"
+      else
+        show_subscription_links
+        printf "\n"
+      fi
     else
       printf "暂无协议。\n\n综合订阅链接:\n未生成\n\n"
     fi
@@ -2895,14 +3026,27 @@ show_protocols() {
   [[ "$(proto_value mixed enabled false)" == "true" ]] &&
     printf "${YELLOW}【    Mixed      】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}包含:${NC}HTTP/SOCKS5\n" "$(proto_value mixed port)" "$(proto_ip_label mixed)"
   printf "\n"
-  show_subscription_links
+  if lite_mode; then
+    printf "${CYAN}安装模式:${NC}${GREEN}NAT 轻量 VLESS Reality${NC}  ${CYAN}HTTP订阅:${NC}未启用\n"
+  else
+    show_subscription_links
+  fi
   printf "\n"
 }
 
 show_protocol_details() {
-  title "单个协议链接和二维码如下："
+  if lite_mode; then
+    title "NAT 轻量 VLESS Reality 节点链接如下："
+  else
+    title "单个协议链接和二维码如下："
+  fi
   if [[ ! -s "$STATE" ]]; then
     printf "暂无协议。\n\n"
+    return
+  fi
+  if lite_mode; then
+    show_protocol_links false
+    printf "${CYAN}HTTP/HTTPS订阅服务:${NC}未安装\n\n"
     return
   fi
   show_protocol_links
@@ -2924,17 +3068,19 @@ view_protocols() {
 }
 
 run_manage() {
+  local services=(sing-box)
+  lite_mode || services+=(sing-box-sub)
   while true; do
     title "Sing-box运行管理"
     printf "1. 启动 Sing-box\n2. 停止 Sing-box\n3. 重启 Sing-box\n4. 查看状态\n5. 查看日志\n6. 开机自启\n7. 关闭开机自启\n8. 检查配置\n0. 返回上一界面\n"
     case "$(ask_menu "请选择: " 8)" in
-      1) systemctl start sing-box sing-box-sub; info "已启动。"; pause ;;
-      2) systemctl stop sing-box sing-box-sub; info "已停止。"; pause ;;
-      3) systemctl restart sing-box sing-box-sub; info "已重启。"; pause ;;
+      1) systemctl start "${services[@]}"; info "已启动。"; pause ;;
+      2) systemctl stop "${services[@]}"; info "已停止。"; pause ;;
+      3) systemctl restart "${services[@]}"; info "已重启。"; pause ;;
       4) systemctl status sing-box --no-pager; pause ;;
       5) journalctl -u sing-box -n 80 --no-pager; pause ;;
-      6) systemctl enable sing-box sing-box-sub; info "已开启开机自启。"; pause ;;
-      7) systemctl disable sing-box sing-box-sub; info "已关闭开机自启。"; pause ;;
+      6) systemctl enable "${services[@]}"; info "已开启开机自启。"; pause ;;
+      7) systemctl disable "${services[@]}"; info "已关闭开机自启。"; pause ;;
       8) "$BIN" check -C "$CONF"; pause ;;
       0) return ;;
     esac
@@ -2951,7 +3097,8 @@ main_menu() {
     menu_line 1 "更新脚本"
     menu_line 2 "删除脚本"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
-    menu_line 3 "一键安装 Sing-box"
+    menu_line 3 "标准安装 Sing-box"
+    menu_line 13 "NAT 轻量安装：仅 Vless-reality"
     menu_line 4 "删除卸载 Sing-box"
     menu_line 5 "Sing-box运行管理"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
@@ -2963,7 +3110,7 @@ main_menu() {
     menu_line 10 "查看协议和综合订阅链接"
     menu_line 11 "更改综合订阅配置"
     menu_line 12 "一键放行所有缺失端口"
-    case "$(ask_menu "请选择: " 12)" in
+    case "$(ask_menu "请选择: " 13)" in
       1) update_script; pause ;;
       2) delete_script ;;
       3) install_sing_box; pause ;;
@@ -2976,6 +3123,7 @@ main_menu() {
       10) view_protocols ;;
       11) change_subscription_config && pause ;;
       12) allow_missing_ufw_ports; pause ;;
+      13) install_nat_lite; pause ;;
       0) exit 0 ;;
     esac
   done
