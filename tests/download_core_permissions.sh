@@ -17,6 +17,10 @@ arch_name() {
   printf 'amd64'
 }
 
+is_alpine() {
+  return 1
+}
+
 fail() {
   printf '%s\n' "$*" >&2
 }

@@ -17,6 +17,7 @@ mkdir -p "$ROOT/bin"
 export VERSION_MARKER
 
 arch_name() { printf 'amd64'; }
+is_alpine() { return 1; }
 info() { :; }
 fail() { printf '%s\n' "$*" >&2; }
 sync() { :; }

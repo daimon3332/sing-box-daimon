@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.5.1"
+SCRIPT_VERSION="1.6.0"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -16,10 +16,27 @@ SCRIPT="$ROOT/sb.sh"
 SUB_SERVER="$ROOT/sub_server.py"
 SERVICE="/etc/systemd/system/sing-box.service"
 SUB_SERVICE="/etc/systemd/system/sing-box-sub.service"
+ALPINE_PACKAGES="$ROOT/alpine-packages"
+APK_REPOSITORIES="${APK_REPOSITORIES:-/etc/apk/repositories}"
 NGINX_SUB_NAME="sing-box-daimon-sub"
 NGINX_SUB_CONF="/etc/nginx/sites-available/$NGINX_SUB_NAME"
 NGINX_SUB_LINK="/etc/nginx/sites-enabled/$NGINX_SUB_NAME"
 SNI_OPTIONS=("www.bing.com" "www.amazon.com" "www.apple.com")
+
+system_id() {
+  local id=""
+  [[ ! -r /etc/os-release ]] || id="$(. /etc/os-release; printf '%s' "${ID:-}")"
+  printf '%s' "$id"
+}
+
+is_alpine() {
+  [[ "$(system_id)" == "alpine" ]]
+}
+
+if is_alpine; then
+  SERVICE="/etc/init.d/sing-box"
+  SUB_SERVICE="/etc/init.d/sing-box-sub"
+fi
 
 RED='\033[31m'
 GREEN='\033[32m'
@@ -79,7 +96,12 @@ has_cmd() {
 }
 
 rand_hex() {
-  python3 - "${1:-16}" <<'PY'
+  local bytes="${1:-16}"
+  if is_alpine || ! has_cmd python3; then
+    od -An -N "$bytes" -tx1 /dev/urandom | tr -d ' \n'
+    return
+  fi
+  python3 - "$bytes" <<'PY'
 import secrets, sys
 print(secrets.token_hex(int(sys.argv[1])))
 PY
@@ -159,6 +181,39 @@ valid_token() {
 
 valid_ip_address() {
   local address="$1" version="$2"
+  if is_alpine || ! has_cmd python3; then
+    if [[ "$version" == "4" ]]; then
+      local a b c d extra
+      IFS=. read -r a b c d extra <<<"$address"
+      [[ -z "${extra:-}" ]] || return 1
+      for a in "$a" "$b" "$c" "$d"; do
+        [[ "$a" =~ ^[0-9]+$ ]] && ((10#$a <= 255)) || return 1
+      done
+      return 0
+    fi
+    [[ "$address" == *:* && "$address" =~ ^[0-9A-Fa-f:]+$ && "$address" != *:::* ]] || return 1
+    local rest="$address" part count=0 compressed=false
+    local -a parts=()
+    if [[ "$address" == *::* ]]; then
+      compressed=true
+      rest="${address/::/:}"
+      [[ "$rest" != *::* ]] || return 1
+    else
+      [[ "$address" != :* && "$address" != *: ]] || return 1
+    fi
+    IFS=: read -ra parts <<<"$rest"
+    for part in "${parts[@]}"; do
+      [[ -z "$part" ]] && continue
+      [[ "$part" =~ ^[0-9A-Fa-f]{1,4}$ ]] || return 1
+      count=$((count + 1))
+    done
+    if [[ "$compressed" == "true" ]]; then
+      ((count < 8))
+    else
+      ((count == 8))
+    fi
+    return
+  fi
   python3 - "$address" "$version" <<'PY' >/dev/null 2>&1
 import ipaddress, sys
 try:
@@ -186,6 +241,19 @@ ensure_dirs() {
 
 ensure_state() {
   ensure_dirs
+  if is_alpine; then
+    has_cmd jq || { fail "Alpine NAT 状态管理需要 jq。"; return 1; }
+    if [[ ! -s "$STATE" ]]; then
+      jq -n --arg token "$(rand_hex 16)" '{token:$token,sub_port:2096,sub_endpoint_host:"",sub_domain:"",sub_tls:false,install_mode:"standard",protocols:{}}' >"$STATE"
+    fi
+    local token tmp
+    token="$(jq -r '.token // ""' "$STATE" 2>/dev/null || true)"
+    if ! valid_token "$token"; then
+      tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+      jq --arg token "$(rand_hex 16)" '.token = $token' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+    fi
+    return
+  fi
   if [[ ! -s "$STATE" ]]; then
     python3 - "$STATE" <<'PY'
 import json, secrets, sys
@@ -217,6 +285,10 @@ PY
 
 has_protocols() {
   [[ -s "$STATE" ]] || return 1
+  if is_alpine; then
+    jq -e 'any(.protocols[]?; .enabled == true)' "$STATE" >/dev/null 2>&1
+    return
+  fi
   python3 - "$STATE" <<'PY'
 import json, sys
 try:
@@ -230,6 +302,13 @@ PY
 state_value() {
   local key="$1" default="${2:-}"
   [[ -s "$STATE" ]] || { printf '%s' "$default"; return; }
+  if is_alpine; then
+    jq -r --arg key "$key" --arg default "$default" '
+      try (getpath($key | split(".")) // $default) catch $default |
+      if type == "boolean" then tostring else tostring end
+    ' "$STATE" 2>/dev/null || printf '%s' "$default"
+    return
+  fi
   python3 - "$STATE" "$key" "$default" <<'PY'
 import json, sys
 try:
@@ -267,6 +346,18 @@ lite_mode() {
 set_state_value() {
   local key="$1" value="$2"
   ensure_state
+  if is_alpine; then
+    local tmp type=string
+    [[ "$key" == "sub_port" || "$key" == "version.checked" ]] && [[ "$value" =~ ^[0-9]+$ ]] && type=number
+    [[ "$value" == "true" || "$value" == "false" ]] && type=boolean
+    tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+    jq --arg key "$key" --arg value "$value" --arg type "$type" '
+      ($key | split(".")) as $path |
+      ($value | if $type == "number" then tonumber elif $type == "boolean" then . == "true" else . end) as $typed |
+      setpath($path; $typed)
+    ' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+    return
+  fi
   python3 - "$STATE" "$key" "$value" <<'PY'
 import json, sys
 path, key, value = sys.argv[1], sys.argv[2].split("."), sys.argv[3]
@@ -297,6 +388,11 @@ refresh_version_cache() {
   latest="$(fetch_latest_script | sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' | head -n1 || true)"
   now="$(date +%s)"
   ensure_state
+  if is_alpine; then
+    [[ -z "$latest" ]] || set_state_value version.latest "$latest"
+    set_state_value version.checked "$now"
+    return
+  fi
   python3 - "$STATE" "$latest" "$now" <<'PY' >/dev/null 2>&1 || true
 import json, sys
 path, latest, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -315,6 +411,7 @@ PY
 }
 
 refresh_version_cache_async() {
+  is_alpine && ! has_cmd jq && return 0
   ( refresh_version_cache ) >/dev/null 2>&1 &
 }
 
@@ -342,6 +439,21 @@ set_protocol() {
   local proto="$1"
   shift
   ensure_state
+  if is_alpine; then
+    local tmp
+    tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+    jq --arg proto "$proto" --args '
+      .protocols[$proto].enabled = true |
+      reduce $ARGS.positional[] as $pair (.;
+        ($pair | index("=")) as $split |
+        ($pair[0:$split]) as $key |
+        ($pair[$split + 1:]) as $raw |
+        ($raw | if ($key | test("port$") or $key == "alter_id") then tonumber elif . == "true" then true elif . == "false" then false else . end) as $value |
+        .protocols[$proto][$key] = $value
+      )
+    ' "$@" <"$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+    return
+  fi
   python3 - "$STATE" "$proto" "$@" <<'PY'
 import json, sys
 path, proto, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
@@ -365,6 +477,12 @@ PY
 delete_protocol_state() {
   local proto="$1"
   [[ -s "$STATE" ]] || return 0
+  if is_alpine; then
+    local tmp
+    tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+    jq --arg proto "$proto" 'del(.protocols[$proto])' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+    return
+  fi
   python3 - "$STATE" "$proto" <<'PY'
 import json, sys
 path, proto = sys.argv[1], sys.argv[2]
@@ -635,6 +753,14 @@ tcp_udp_used() {
 config_port_used() {
   local port="$1"
   [[ -d "$CONF" ]] || return 1
+  if is_alpine; then
+    local files=("$CONF"/*.json)
+    [[ -e "${files[0]}" ]] || return 1
+    jq -se --argjson port "$port" '
+      any(.[]; any(.. | objects; (.listen_port? == $port) or (.server_port? == $port) or (.local_port? == $port)))
+    ' "${files[@]}" >/dev/null 2>&1
+    return
+  fi
   python3 - "$CONF" "$port" <<'PY'
 import json, pathlib, sys
 root, wanted = pathlib.Path(sys.argv[1]), int(sys.argv[2])
@@ -662,6 +788,10 @@ PY
 state_port_used() {
   local port="$1"
   [[ -s "$STATE" ]] || return 1
+  if is_alpine; then
+    jq -e --argjson port "$port" 'any(.protocols[]?; .port == $port)' "$STATE" >/dev/null 2>&1
+    return
+  fi
   python3 - "$STATE" "$port" <<'PY'
 import json, sys
 try:
@@ -1540,6 +1670,11 @@ generate_subscription() {
     return 1
   fi
   validate_protocol_hosts || return 1
+  if lite_mode; then
+    protocol_link_rows | cut -f2- >"$SUB/raw.txt"
+    rm -f "$SUB/clash.yaml" "$SUB/v2rayn_raw.txt" "$SUB/v2rayn.txt" "$SUB/sub.txt"
+    return
+  fi
   token="$(state_value token)"
   ipv4="$DETECTED_PUBLIC_IPV4"
   ipv6="$DETECTED_PUBLIC_IPV6"
@@ -1922,8 +2057,90 @@ write_managed_script() {
   fi
 }
 
+managed_service_exists() {
+  local name="$1"
+  if is_alpine; then
+    [[ -x "/etc/init.d/$name" ]]
+  else
+    systemctl list-unit-files "$name.service" >/dev/null 2>&1 || systemctl status "$name.service" >/dev/null 2>&1
+  fi
+}
+
+managed_service_enable() {
+  if is_alpine; then
+    rc-update add "$1" default >/dev/null 2>&1
+  else
+    systemctl enable "$1" >/dev/null 2>&1
+  fi
+}
+
+managed_service_disable_now() {
+  if is_alpine; then
+    rc-service "$1" stop >/dev/null 2>&1 || true
+    rc-update del "$1" default >/dev/null 2>&1 || true
+  else
+    systemctl disable --now "$1" >/dev/null 2>&1 || true
+  fi
+}
+
+managed_service_start() {
+  if is_alpine; then rc-service "$1" start; else systemctl start "$1"; fi
+}
+
+managed_service_stop() {
+  if is_alpine; then rc-service "$1" stop; else systemctl stop "$1"; fi
+}
+
+managed_service_restart() {
+  if is_alpine; then rc-service "$1" restart; else systemctl restart "$1"; fi
+}
+
+managed_service_active() {
+  if is_alpine; then
+    rc-service "$1" status >/dev/null 2>&1
+  else
+    systemctl is-active --quiet "$1"
+  fi
+}
+
+managed_service_status() {
+  if is_alpine; then rc-service "$1" status; else systemctl status "$1" --no-pager; fi
+}
+
+managed_service_enable_only() {
+  if is_alpine; then rc-update add "$1" default; else systemctl enable "$1"; fi
+}
+
+managed_service_disable_only() {
+  if is_alpine; then rc-update del "$1" default; else systemctl disable "$1"; fi
+}
+
 write_services() {
   local mode="${1:-standard}"
+  if is_alpine; then
+    [[ "$mode" == "lite" ]] || { fail "Alpine 仅支持 NAT 轻量 VLESS Reality 安装。"; return 1; }
+    cat >"$SERVICE" <<EOF
+#!/sbin/openrc-run
+name="sing-box"
+description="sing-box NAT lite service"
+command="$BIN"
+command_args="run -C $CONF"
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+output_log="$LOG/sing-box.log"
+error_log="$LOG/sing-box.log"
+
+depend() {
+  need net
+  after firewall
+}
+EOF
+    chmod 0755 "$SERVICE"
+    managed_service_disable_now sing-box-sub
+    rm -f "$SUB_SERVICE" "$SUB_SERVER"
+    return
+  fi
   cat >"$SERVICE" <<EOF
 [Unit]
 Description=sing-box service
@@ -1974,10 +2191,48 @@ restart_sub_service() {
 
 lite_dependencies_ready() {
   local cmd
+  if is_alpine; then
+    for cmd in bash curl jq apk rc-service rc-update; do
+      has_cmd "$cmd" || return 1
+    done
+    [[ -s /etc/ssl/certs/ca-certificates.crt ]]
+    return
+  fi
   for cmd in curl tar gzip python3 ss; do
     has_cmd "$cmd" || return 1
   done
   [[ -s /etc/ssl/certs/ca-certificates.crt ]]
+}
+
+install_alpine_lite_dependencies() {
+  local package tmp
+  local required=(bash curl ca-certificates jq)
+  local missing=()
+  local installed=()
+  ensure_dirs
+  for package in "${required[@]}"; do
+    apk info -e "$package" >/dev/null 2>&1 || missing+=("$package")
+  done
+  if ((${#missing[@]})); then
+    info "正在安装 Alpine NAT 最小依赖：${missing[*]}"
+    apk add --no-cache "${missing[@]}" || {
+      fail "Alpine NAT 最小依赖安装失败。"
+      return 1
+    }
+    sync
+    sleep 1
+    installed=("${missing[@]}")
+  fi
+  if ((${#installed[@]})); then
+    tmp="$(mktemp "$ROOT/.alpine-packages.XXXXXX")"
+    { [[ ! -s "$ALPINE_PACKAGES" ]] || cat "$ALPINE_PACKAGES"; printf '%s\n' "${installed[@]}"; } |
+      awk 'NF && !seen[$0]++' >"$tmp"
+    mv -f "$tmp" "$ALPINE_PACKAGES"
+  fi
+  lite_dependencies_ready || {
+    fail "Alpine NAT 必需依赖仍不完整。"
+    return 1
+  }
 }
 
 download_debian_lite_packages() {
@@ -2089,7 +2344,9 @@ install_dependencies() {
       info "NAT 必需依赖已齐全，跳过包管理器。"
       return 0
     fi
-    if has_cmd apt-get; then
+    if is_alpine; then
+      install_alpine_lite_dependencies || return 1
+    elif has_cmd apt-get; then
       install_apt_lite_dependencies || return 1
     elif has_cmd dnf; then
       dnf install -y --setopt=install_weak_deps=False "${rpm_packages[@]:0:6}"
@@ -2341,6 +2598,90 @@ arch_name() {
 
 download_core() {
   local mode="${1:-standard}" arch url tmp file lib stale
+  if is_alpine; then
+    [[ "$mode" == "lite" ]] || {
+      fail "Alpine 仅支持 NAT 轻量内核安装。"
+      return 1
+    }
+    while IFS= read -r stale; do
+      [[ "$stale" == "$ROOT"/.download.* ]] && rm -rf -- "$stale"
+    done < <(find "$ROOT" -mindepth 1 -maxdepth 1 -type d -name '.download.*' -print 2>/dev/null)
+    tmp="$(mktemp -d "$ROOT/.download.XXXXXX")" || {
+      fail "无法创建 Alpine sing-box 下载目录。"
+      return 1
+    }
+    local repository version marker sync_pid
+    repository="$(awk '
+      /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+      /\/community[[:space:]]*$/ { print $NF; exit }
+    ' "$APK_REPOSITORIES")"
+    arch="$(apk --print-arch)"
+    [[ -n "$repository" && -n "$arch" ]] || {
+      rm -rf -- "$tmp"
+      fail "未找到 Alpine community 仓库或系统架构。"
+      return 1
+    }
+    version="$(curl -fLsS --limit-rate 2M "$repository/$arch/APKINDEX.tar.gz" |
+      tar -xzO APKINDEX |
+      awk 'BEGIN { RS=""; FS="\n" }
+        !found && $0 ~ /(^|\n)P:sing-box(\n|$)/ {
+          for (i=1; i<=NF; i++) if ($i ~ /^V:/) { print substr($i, 3); found=1; break }
+        }
+      ')"
+    [[ -n "$version" ]] || {
+      rm -rf -- "$tmp"
+      fail "Alpine community 仓库中未找到 sing-box。"
+      return 1
+    }
+    url="$repository/$arch/sing-box-$version.apk"
+    info "正在以最低内存方式安装 Alpine sing-box $version..."
+    if ! curl -fLsS --limit-rate 1M "$url" -o "$tmp/sing-box.apk"; then
+      rm -rf -- "$tmp"
+      fail "Alpine sing-box 包下载失败。"
+      return 1
+    fi
+    sync
+    if ! apk verify "$tmp/sing-box.apk" >/dev/null 2>&1; then
+      rm -rf -- "$tmp"
+      fail "Alpine sing-box 包签名校验失败。"
+      return 1
+    fi
+    marker="$tmp/.sync"
+    : >"$marker"
+    ( while [[ -e "$marker" ]]; do sync; sleep 1; done ) &
+    sync_pid=$!
+    if ! curl -fLsS --limit-rate 512K "file://$tmp/sing-box.apk" |
+      tar -xzf - -C "$tmp" usr/bin/sing-box; then
+      rm -f "$marker"
+      wait "$sync_pid" 2>/dev/null || true
+      rm -rf -- "$tmp"
+      fail "Alpine sing-box 内核提取失败。"
+      return 1
+    fi
+    rm -f "$marker"
+    wait "$sync_pid" 2>/dev/null || true
+    file="$tmp/usr/bin/sing-box"
+    rm -f "$tmp/sing-box.apk"
+    sync
+    chmod 0755 "$file" || {
+      rm -rf -- "$tmp"
+      fail "无法设置 Alpine sing-box 内核权限。"
+      return 1
+    }
+    "$file" version >/dev/null 2>&1 || {
+      rm -rf -- "$tmp"
+      fail "Alpine sing-box 原生内核无法执行。"
+      return 1
+    }
+    mv -f "$file" "$BIN" || {
+      rm -rf -- "$tmp"
+      fail "无法原子安装 Alpine sing-box 内核。"
+      return 1
+    }
+    chmod 0755 "$BIN"
+    rm -rf -- "$tmp"
+    return
+  fi
   arch="$(arch_name)"
   while IFS= read -r stale; do
     [[ "$stale" == "$ROOT"/.download.* ]] && rm -rf -- "$stale"
@@ -2593,6 +2934,10 @@ add_all_protocols() {
 
 install_sing_box() {
   need_root
+  if is_alpine; then
+    fail "Alpine 仅支持菜单 13 的 NAT 轻量 VLESS Reality 安装。"
+    return 1
+  fi
   install_dependencies standard
   ensure_dirs
   ensure_state
@@ -2635,7 +2980,7 @@ install_nat_lite() {
   write_services lite
   install_shortcuts
   sync_ufw_ports
-  systemctl enable sing-box >/dev/null 2>&1 || true
+  managed_service_enable sing-box || true
   choose_node_ip_version "NAT 轻量 VLESS" || return 1
   local keys private_key public_key
   keys="$(reality_keypair || true)"
@@ -2653,14 +2998,37 @@ install_nat_lite() {
     "private_key=$private_key" \
     "public_key=$public_key"
   rebuild_configs || return 1
-  if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box; then
+  if managed_service_restart sing-box >/dev/null 2>&1 && managed_service_active sing-box; then
     info "NAT 轻量 VLESS Reality 已安装并运行。外部端口请在 NAT 页面映射为同一端口。"
     show_protocol_details
     return 0
   fi
   fail "NAT 轻量 VLESS Reality 已写入，但 Sing-box 启动失败。"
-  systemctl status sing-box --no-pager 2>/dev/null || true
+  managed_service_status sing-box 2>/dev/null || true
   return 1
+}
+
+remove_alpine_managed_packages() {
+  local remove_all="${1:-false}" package tmp
+  local remove=()
+  local keep=()
+  is_alpine && [[ -s "$ALPINE_PACKAGES" ]] || return 0
+  while IFS= read -r package; do
+    [[ -n "$package" ]] || continue
+    if [[ "$remove_all" == "true" || "$package" == "sing-box" || "$package" == "jq" ]]; then
+      remove+=("$package")
+    else
+      keep+=("$package")
+    fi
+  done <"$ALPINE_PACKAGES"
+  ((${#remove[@]})) && apk del "${remove[@]}" >/dev/null 2>&1 || true
+  if [[ "$remove_all" == "true" || ${#keep[@]} -eq 0 ]]; then
+    rm -f "$ALPINE_PACKAGES"
+  else
+    tmp="$(mktemp "$ROOT/.alpine-packages.XXXXXX")"
+    printf '%s\n' "${keep[@]}" >"$tmp"
+    mv -f "$tmp" "$ALPINE_PACKAGES"
+  fi
 }
 
 uninstall_sing_box() {
@@ -2668,16 +3036,18 @@ uninstall_sing_box() {
   local yn
   safe_read "确认删除所有协议并卸载 Sing-box？管理脚本会保留。[y/N]: " yn
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
-  systemctl disable --now sing-box sing-box-sub >/dev/null 2>&1 || true
+  managed_service_disable_now sing-box
+  managed_service_disable_now sing-box-sub
   remove_subscription_nginx_and_cert "$(state_value sub_domain "")"
   delete_all_ufw_rules
   delete_hopping_rules hysteria2
   delete_hopping_rules tuic
   save_firewall_rules
   rm -f "$SERVICE" "$SUB_SERVICE"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
   rm -rf "$ROOT/bin" "$CONF" "$CERT" "$SUB" "$LOG"
   rm -f "$STATE" "$SUB_SERVER"
+  remove_alpine_managed_packages false
   ensure_dirs
   info "Sing-box 和所有协议已卸载，管理脚本已保留。"
 }
@@ -2687,16 +3057,18 @@ delete_script() {
   local yn
   safe_read "确认删除脚本、所有协议和 Sing-box？此操作不可恢复。[y/N]: " yn
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
-  systemctl disable --now sing-box sing-box-sub >/dev/null 2>&1 || true
+  managed_service_disable_now sing-box
+  managed_service_disable_now sing-box-sub
   remove_subscription_nginx_and_cert "$(state_value sub_domain "")"
   delete_all_ufw_rules
   delete_hopping_rules hysteria2
   delete_hopping_rules tuic
   save_firewall_rules
   rm -f "$SERVICE" "$SUB_SERVICE"
-  systemctl daemon-reload >/dev/null 2>&1 || true
+  is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
   [[ "$(readlink -f /usr/local/bin/sb 2>/dev/null || true)" == "$SCRIPT" ]] && rm -f /usr/local/bin/sb
   [[ "$(readlink -f /usr/local/bin/sing-box 2>/dev/null || true)" == "$SCRIPT" ]] && rm -f /usr/local/bin/sing-box
+  remove_alpine_managed_packages true
   [[ "$ROOT" == "/etc/sing-box" ]] && rm -rf "$ROOT"
   info "脚本、Sing-box 和所有协议已删除。"
   exit 0
@@ -2721,12 +3093,16 @@ update_script() {
   latest="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
   install -m 0755 "$tmp" "$SCRIPT"
   rm -f "$tmp"
-  write_sub_server
-  write_services
+  if lite_mode; then
+    write_services lite
+  else
+    write_sub_server
+    write_services standard
+  fi
   ln -sf "$SCRIPT" /usr/local/bin/sb
   ln -sf "$SCRIPT" /usr/local/bin/sing-box
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  restart_sub_service || true
+  is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
+  lite_mode || restart_sub_service || true
   refresh_version_cache >/dev/null 2>&1 || true
   info "脚本已更新：${SCRIPT_VERSION} -> ${latest:-未知}。正在重新载入新版脚本..."
   sleep 1
@@ -2734,7 +3110,7 @@ update_script() {
 }
 
 systemd_unit_exists() {
-  systemctl list-unit-files "$1" >/dev/null 2>&1 || systemctl status "$1" >/dev/null 2>&1
+  managed_service_exists "${1%.service}"
 }
 
 restart_if_running() {
@@ -2746,17 +3122,17 @@ restart_if_running() {
         fail "sing-box 配置检查失败，未重启服务。"
         "$BIN" check -C "$CONF" || true
       else
-        systemctl reset-failed sing-box >/dev/null 2>&1 || true
-        if systemctl restart sing-box >/dev/null 2>&1 && systemctl is-active --quiet sing-box; then
+        is_alpine || systemctl reset-failed sing-box >/dev/null 2>&1 || true
+        if managed_service_restart sing-box >/dev/null 2>&1 && managed_service_active sing-box; then
           info "Sing-box 已应用新配置并运行。"
         else
           fail "Sing-box 重启失败，请查看运行管理日志。"
-          systemctl status sing-box --no-pager 2>/dev/null || true
+          managed_service_status sing-box 2>/dev/null || true
         fi
       fi
     else
-      systemctl stop sing-box >/dev/null 2>&1 || true
-      systemctl reset-failed sing-box >/dev/null 2>&1 || true
+      managed_service_stop sing-box >/dev/null 2>&1 || true
+      is_alpine || systemctl reset-failed sing-box >/dev/null 2>&1 || true
       info "未启用协议，Sing-box 已停止。"
     fi
   fi
@@ -3095,7 +3471,7 @@ region_name() {
 sing_box_status() {
   if [[ ! -x "$BIN" && ! -f "$SERVICE" ]]; then
     printf '未安装'
-  elif systemctl is-active --quiet sing-box 2>/dev/null; then
+  elif managed_service_active sing-box 2>/dev/null; then
     printf '已运行'
   else
     printf '未运行'
@@ -3211,13 +3587,13 @@ run_manage() {
     title "Sing-box运行管理"
     printf "1. 启动 Sing-box\n2. 停止 Sing-box\n3. 重启 Sing-box\n4. 查看状态\n5. 查看日志\n6. 开机自启\n7. 关闭开机自启\n8. 检查配置\n0. 返回上一界面\n"
     case "$(ask_menu "请选择: " 8)" in
-      1) systemctl start "${services[@]}"; info "已启动。"; pause ;;
-      2) systemctl stop "${services[@]}"; info "已停止。"; pause ;;
-      3) systemctl restart "${services[@]}"; info "已重启。"; pause ;;
-      4) systemctl status sing-box --no-pager; pause ;;
-      5) journalctl -u sing-box -n 80 --no-pager; pause ;;
-      6) systemctl enable "${services[@]}"; info "已开启开机自启。"; pause ;;
-      7) systemctl disable "${services[@]}"; info "已关闭开机自启。"; pause ;;
+      1) for service in "${services[@]}"; do managed_service_start "$service"; done; info "已启动。"; pause ;;
+      2) for service in "${services[@]}"; do managed_service_stop "$service"; done; info "已停止。"; pause ;;
+      3) for service in "${services[@]}"; do managed_service_restart "$service"; done; info "已重启。"; pause ;;
+      4) managed_service_status sing-box; pause ;;
+      5) if is_alpine; then tail -n 80 "$LOG/sing-box.log" 2>/dev/null || true; else journalctl -u sing-box -n 80 --no-pager; fi; pause ;;
+      6) for service in "${services[@]}"; do managed_service_enable_only "$service"; done; info "已开启开机自启。"; pause ;;
+      7) for service in "${services[@]}"; do managed_service_disable_only "$service"; done; info "已关闭开机自启。"; pause ;;
       8) "$BIN" check -C "$CONF"; pause ;;
       0) return ;;
     esac

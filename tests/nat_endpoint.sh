@@ -99,4 +99,12 @@ for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls; do
   [[ "$(proto_value "$proto" ip_version "")" == "custom" ]]
 done
 
+is_alpine() { return 0; }
+valid_ip_address '2a0e:97c0:3f0:1::1c9e' 6
+valid_ip_address '::1' 6
+valid_ip_address '2001:db8:0:1:2:3:4:5' 6
+! valid_ip_address ':2001:db8:0:1:2:3:4:5' 6
+! valid_ip_address '2001:db8:0:1:2:3:4:5:' 6
+! valid_ip_address '2001:db8::1::2' 6
+
 printf 'NAT_ENDPOINT_TEST=PASS\n'

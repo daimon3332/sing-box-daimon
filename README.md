@@ -23,14 +23,16 @@ sb
 sing-box
 ```
 
-安装菜单提供两种模式：
+脚本自动识别 Debian 或 Alpine。安装菜单提供两种模式：
 
-- `3. 标准安装 Sing-box`：安装完整协议管理、二维码和 HTTP/HTTPS 订阅能力。
-- `13. NAT 轻量安装：仅 Vless-reality`：面向 64 MB 等低内存 NAT 容器，只运行 VLESS Reality。
+- `3. 标准安装 Sing-box`：Debian 等 systemd 系统的完整协议、二维码和 HTTP/HTTPS 订阅能力；Alpine 不支持此模式。
+- `13. NAT 轻量安装：仅 Vless-reality`：支持 Debian 与 Alpine，面向 64 MB 等低内存 NAT 容器，只运行 VLESS Reality。
 
-NAT 轻量安装只询问一次客户端连接 IPv4、IPv6 或域名；监听端口自动生成，不询问外部端口。请在 NAT 服务商面板把显示的端口映射到相同内部端口。该模式不安装 OpenSSL、qrencode、自签证书或 Python 订阅进程，也不提供 HTTP/HTTPS 订阅和二维码，只显示可直接导入客户端的 VLESS 链接。Python 仅用于短时状态管理，不作为常驻进程。需要完整功能时再次运行脚本并选择菜单 `3`，即可按原状态升级为标准模式。
+NAT 轻量安装只询问一次客户端连接 IPv4、IPv6 或域名；监听端口自动生成，不询问外部端口。请在 NAT 服务商面板把显示的端口映射到相同内部端口。该模式不安装 OpenSSL、qrencode、自签证书或 Python 订阅进程，也不提供 HTTP/HTTPS 订阅和二维码，只显示可直接导入客户端的 VLESS 链接。Debian 使用 Python 做短时状态管理但不常驻；Alpine 不安装 Python，使用 jq 管理状态并由 OpenRC 托管 sing-box。Debian 可通过菜单 `3` 原地升级到标准模式，Alpine 只支持菜单 `13`。
 
-NAT 模式会先检查必需命令，依赖齐全时完全跳过包管理器。低内存 Debian 缺少依赖时，脚本从 Debian 官方索引流式筛选所需包、校验 SHA256，再由 dpkg 分阶段安装，不执行高峰值的常规 `apt-get update`。sing-box 内核以 1 MB/s 流式下载，只提取 NAT 所需主程序并周期同步写盘，不落地压缩包和非必要运行库；候选内核验证成功后再原子替换。当前最低实测环境为 64 MB RAM、64 MB swap、Debian 13。
+NAT 模式会先检查必需命令，依赖齐全时完全跳过包管理器。低内存 Debian 缺少依赖时，脚本从 Debian 官方索引流式筛选所需包、校验 SHA256，再由 dpkg 分阶段安装，不执行高峰值的常规 `apt-get update`。Alpine 只补实际缺少的 Bash、curl、CA 或 jq；sing-box APK 先通过系统 APK 密钥校验签名，再用 BusyBox tar 只提取原生主程序，不把 sing-box 安装进 APK 包数据库。两种系统都使用限速下载、周期同步写盘和同文件系统原子替换。当前最低实测环境为 64 MB RAM、64 MB swap，覆盖 Debian 13 与 Alpine 3.24 x86_64。
+
+极简 Alpine 如果尚无 Bash，需要先执行 `apk add --no-cache bash`，再运行上面的安装命令；脚本启动后会自动补齐其余缺失依赖。
 
 手动彻底删除脚本、sing-box、节点、订阅服务、脚本托管的 UFW 规则和跳跃端口转发：
 
@@ -324,7 +326,7 @@ http://IP:2096/sub/token/mihomo
 - 添加协议时自动检测公网 IPv4/IPv6：可使用检测地址，也可手动输入客户端连接地址
 - 一键添加协议只询问一次客户端连接地址，并应用到本次新建的全部默认协议
 - NAT 轻量安装只生成 VLESS Reality，一次选择客户端连接地址并自动生成监听端口和认证参数
-- NAT 轻量模式不安装 OpenSSL、qrencode、自签证书或订阅进程，可通过标准安装原地升级
+- NAT 轻量模式不安装 OpenSSL、qrencode、自签证书或订阅进程；Debian 可通过标准安装原地升级，Alpine 保持仅 VLESS Reality
 - NAT 依赖齐全时不调用包管理器；缺失依赖时流式筛选官方索引并分阶段安装
 - NAT 内核不落地压缩包和非必要运行库，使用限速流式解压、周期写盘和同文件系统原子替换
 - 添加协议时支持放弃自动检测，手动输入客户端连接 IPv4、IPv6 或域名，适配 NAT 入口地址
@@ -372,6 +374,6 @@ http://IP:2096/sub/token/mihomo
 /etc/systemd/system/sing-box-sub.service
 ```
 
-NAT 轻量模式保留 `bin/sing-box`、VLESS 配置、状态文件、管理脚本和 `sing-box.service`，不会创建证书文件、`sub_server.py` 或 `sing-box-sub.service`。
+NAT 轻量模式保留 `bin/sing-box`、VLESS 配置、状态文件和管理脚本，不会创建证书文件、`sub_server.py` 或订阅服务。Debian 使用 `/etc/systemd/system/sing-box.service`，Alpine 使用 `/etc/init.d/sing-box`。
 
 本仓库只保存管理脚本、README 和计划文件；实际安装和运行文件由脚本在 VPS 上创建。
