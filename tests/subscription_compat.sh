@@ -85,6 +85,11 @@ assert address == "[2001:db8::10]:30000"
 assert fragment == "Mixed-SOCKS5"
 PY
 
+lite_mode() { return 1; }
+has_protocols() { return 0; }
+printf 'v2rayn://socks/legacy\n' >"$SUB/v2rayn_raw.txt"
+legacy_subscription_needs_refresh
+
 refresh_calls=()
 need_root() { :; }
 ensure_state() { :; }

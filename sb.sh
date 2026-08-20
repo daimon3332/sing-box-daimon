@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.6.1"
+SCRIPT_VERSION="1.6.2"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -3119,6 +3119,13 @@ refresh_installed() {
   restart_sub_service
 }
 
+legacy_subscription_needs_refresh() {
+  lite_mode && return 1
+  has_protocols || return 1
+  [[ -s "$SUB/v2rayn_raw.txt" ]] || return 0
+  grep -Eq 'AllowInsecure":"true"|v2rayn://socks/' "$SUB/v2rayn_raw.txt"
+}
+
 systemd_unit_exists() {
   managed_service_exists "${1%.service}"
 }
@@ -3655,6 +3662,11 @@ main_menu() {
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-}" in
     --refresh-installed) refresh_installed ;;
-    *) main_menu ;;
+    *)
+      if legacy_subscription_needs_refresh; then
+        refresh_installed || warn "检测到旧版订阅格式，但自动刷新失败，请在菜单中重新执行更新。"
+      fi
+      main_menu
+      ;;
   esac
 fi
