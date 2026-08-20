@@ -238,7 +238,7 @@ $text = Get-Content $Sub -Raw
 $decodedText = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($text.Trim()))
 Set-Content -Path $Decoded -Value $decodedText -Encoding UTF8
 
-$required = @("vless://","vmess://","v2rayn://hysteria2/","v2rayn://tuic/","v2rayn://anytls/","trojan://","ss://","v2rayn://socks/")
+$required = @("vless://","vmess://","v2rayn://hysteria2/","v2rayn://tuic/","v2rayn://anytls/","trojan://","ss://","socks://")
 foreach ($item in $required) {
   if ($decodedText -notlike "*$item*") { throw "missing $item" }
 }
@@ -255,7 +255,7 @@ v2rayn://tuic/
 v2rayn://anytls/
 trojan://
 ss://
-v2rayn://socks/
+socks://
 ```
 
 如果要做 v2rayN core 连通测试，使用 v2rayN 自带 core：
@@ -301,7 +301,9 @@ http://IP:2096/sub/token
 http://IP:2096/sub/token/v2rayn
 ```
 
-默认订阅输出 Base64，包含 VLESS Reality、VMess WS、Hysteria2、TUIC v5、AnyTLS、Mixed/SOCKS5。Hy2/TUIC/AnyTLS/Mixed 会使用 v2rayN 专用链接指定 sing-box core，避免被默认导入成不兼容节点。
+默认订阅输出 Base64，包含 VLESS Reality、VMess WS、Hysteria2、TUIC v5、AnyTLS、Mixed/SOCKS5。Hy2/TUIC/AnyTLS 使用 v2rayN 专用链接指定 sing-box core；Hy2/TUIC 会嵌入自签证书并关闭不安全跳过验证，Mixed 使用标准 `socks://` 链接，兼容新版 v2rayN。
+
+执行菜单 `1. 更新脚本` 时会保留现有协议、端口和认证参数，并自动重新生成 v2rayN、Clash/Mihomo 和原始订阅后重启订阅服务。
 
 ### Clash / Mihomo
 

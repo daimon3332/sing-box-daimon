@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.6.1"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -1927,10 +1927,10 @@ if enabled("hysteria2"):
     if hs and he:
         extra["Ports"] = f"{hs}-{he}"
         extra["HopInterval"] = "30"
-    item = {"ConfigType":7,"CoreType":24,"ConfigVersion":4,"Remarks":"Hysteria-2","Address":host_for("hysteria2"),"Port":val("hysteria2", "port"),"Password":val("hysteria2", "password"),"StreamSecurity":"tls","AllowInsecure":"true","Sni":val("hysteria2", "sni", "www.bing.com"),"Alpn":"h3","ProtoExtraObj":extra}
+    item = {"ConfigType":7,"CoreType":24,"ConfigVersion":4,"Remarks":"Hysteria-2","Address":host_for("hysteria2"),"Port":val("hysteria2", "port"),"Password":val("hysteria2", "password"),"StreamSecurity":"tls","AllowInsecure":"false","Sni":val("hysteria2", "sni", "www.bing.com"),"Alpn":"h3","Cert":cert,"ProtoExtraObj":extra}
     v2.append("v2rayn://hysteria2/" + b64url_json(item))
 if enabled("tuic"):
-    item = {"ConfigType":8,"CoreType":24,"ConfigVersion":4,"Remarks":"Tuic-v5","Address":host_for("tuic"),"Port":val("tuic", "port"),"Username":val("tuic", "uuid"),"Password":val("tuic", "password"),"StreamSecurity":"tls","AllowInsecure":"true","Sni":val("tuic", "sni", "www.bing.com"),"Alpn":"h3","ProtoExtraObj":{"CongestionControl":"bbr"}}
+    item = {"ConfigType":8,"CoreType":24,"ConfigVersion":4,"Remarks":"Tuic-v5","Address":host_for("tuic"),"Port":val("tuic", "port"),"Username":val("tuic", "uuid"),"Password":val("tuic", "password"),"StreamSecurity":"tls","AllowInsecure":"false","Sni":val("tuic", "sni", "www.bing.com"),"Alpn":"h3","Cert":cert,"ProtoExtraObj":{"CongestionControl":"bbr"}}
     v2.append("v2rayn://tuic/" + b64url_json(item))
 if enabled("anytls"):
     item = {"ConfigType":11,"CoreType":24,"ConfigVersion":4,"Remarks":"Anytls","Address":host_for("anytls"),"Port":val("anytls", "port"),"Password":val("anytls", "password"),"StreamSecurity":"tls","AllowInsecure":"false","Sni":val("anytls", "sni", "www.bing.com"),"Fingerprint":"chrome","Cert":cert}
@@ -1948,8 +1948,8 @@ if enabled("vmess_http"):
     vm = {"v":"2","ps":"Vmess-http","add":host_for("vmess_http"),"port":str(val("vmess_http", "port")),"id":val("vmess_http", "uuid"),"aid":"0","scy":"auto","net":"http","type":"none","host":val("vmess_http", "host", "www.bing.com"),"path":val("vmess_http", "path", "/vmess-http"),"tls":""}
     v2.append("vmess://" + b64(json.dumps(vm, separators=(",", ":"), ensure_ascii=False)))
 if enabled("mixed"):
-    item = {"ConfigType":4,"CoreType":24,"ConfigVersion":4,"Remarks":"Mixed-SOCKS5","Address":host_for("mixed"),"Port":val("mixed", "port"),"Username":val("mixed", "username", "daimon"),"Password":val("mixed", "password", "daimon")}
-    v2.append("v2rayn://socks/" + b64url_json(item))
+    credentials = base64.b64encode(f"{val('mixed', 'username', 'daimon')}:{val('mixed', 'password', 'daimon')}".encode()).decode()
+    v2.append("socks://{}@{}:{}#Mixed-SOCKS5".format(credentials, uri_host(host_for("mixed")), val("mixed", "port")))
 open(v2rayn_path, "w", encoding="utf-8").write("\n".join(v2) + ("\n" if v2 else ""))
 PY
   b64 <"$v2rayn_raw" >"$SUB/v2rayn.txt"
@@ -3093,20 +3093,30 @@ update_script() {
   latest="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
   install -m 0755 "$tmp" "$SCRIPT"
   rm -f "$tmp"
-  if lite_mode; then
-    write_services lite
-  else
-    write_sub_server
-    write_services standard
-  fi
   ln -sf "$SCRIPT" /usr/local/bin/sb
   ln -sf "$SCRIPT" /usr/local/bin/sing-box
-  is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
-  lite_mode || restart_sub_service || true
+  if ! "$SCRIPT" --refresh-installed; then
+    fail "脚本已更新，但已有安装状态刷新失败，请重新执行更新或检查服务日志。"
+    return 1
+  fi
   refresh_version_cache >/dev/null 2>&1 || true
   info "脚本已更新：${SCRIPT_VERSION} -> ${latest:-未知}。正在重新载入新版脚本..."
   sleep 1
   exec "$SCRIPT"
+}
+
+refresh_installed() {
+  need_root
+  ensure_state
+  ensure_dirs
+  if lite_mode; then
+    write_services lite
+    return 0
+  fi
+  write_sub_server
+  write_services standard
+  generate_subscription
+  restart_sub_service
 }
 
 systemd_unit_exists() {
@@ -3643,5 +3653,8 @@ main_menu() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
-  main_menu
+  case "${1:-}" in
+    --refresh-installed) refresh_installed ;;
+    *) main_menu ;;
+  esac
 fi
