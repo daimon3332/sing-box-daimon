@@ -59,6 +59,7 @@ print(json.dumps(json.load(open(sys.argv[1], encoding="utf-8")), sort_keys=True,
 PY
 )"
 [[ "$before_state" == "$after_state" ]]
+grep -Fq 'heartbeat-interval: 10000' "$SUB/clash.yaml"
 
 python3 - "$SUB/v2rayn_raw.txt" <<'PY'
 import base64, json, sys
@@ -95,11 +96,12 @@ need_root() { :; }
 ensure_state() { :; }
 ensure_dirs() { :; }
 lite_mode() { return 1; }
+managed_service_active() { return 1; }
+rebuild_configs() { refresh_calls+=(rebuild_configs); }
 write_sub_server() { refresh_calls+=(write_sub_server); }
 write_services() { [[ "${1:-}" == standard ]]; refresh_calls+=(write_services); }
-generate_subscription() { refresh_calls+=(generate_subscription); }
 restart_sub_service() { refresh_calls+=(restart_sub_service); }
 refresh_installed
-[[ "${refresh_calls[*]}" == "write_sub_server write_services generate_subscription restart_sub_service" ]]
+[[ "${refresh_calls[*]}" == "rebuild_configs write_sub_server write_services restart_sub_service" ]]
 
 printf 'SUBSCRIPTION_COMPAT_TEST=PASS\n'

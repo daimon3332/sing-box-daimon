@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.6.2"
+SCRIPT_VERSION="1.6.3"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -1121,6 +1121,7 @@ write_tuic_config() {
         }
       ],
       "congestion_control": "bbr",
+      "heartbeat": "10s",
       "tls": {
         "enabled": true,
         "alpn": [
@@ -1803,6 +1804,7 @@ if enabled("tuic"):
         "    reduce-rtt: true",
         "    request-timeout: 8000",
         "    udp-relay-mode: native",
+        "    heartbeat-interval: 10000",
         "    congestion-controller: bbr",
         f"    sni: {q(val('tuic', 'sni', 'www.bing.com'))}",
         "    skip-cert-verify: true",
@@ -2149,7 +2151,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=$BIN run -C $CONF
-Restart=on-failure
+Restart=always
 RestartSec=3
 LimitNOFILE=1048576
 
@@ -2165,7 +2167,7 @@ Wants=network-online.target
 
 [Service]
 ExecStart=/usr/bin/python3 $SUB_SERVER
-Restart=on-failure
+Restart=always
 RestartSec=3
 
 [Install]
@@ -3107,15 +3109,26 @@ update_script() {
 
 refresh_installed() {
   need_root
+  local sing_box_active=false
   ensure_state
   ensure_dirs
   if lite_mode; then
     write_services lite
     return 0
   fi
+  managed_service_active sing-box 2>/dev/null && sing_box_active=true
+  rebuild_configs
   write_sub_server
   write_services standard
-  generate_subscription
+  if [[ "$sing_box_active" == "true" ]]; then
+    if ! "$BIN" check -C "$CONF" >/dev/null 2>&1; then
+      fail "sing-box 配置检查失败，未应用更新。"
+      "$BIN" check -C "$CONF" || true
+      return 1
+    fi
+    managed_service_restart sing-box >/dev/null 2>&1 || return 1
+    managed_service_active sing-box || return 1
+  fi
   restart_sub_service
 }
 
