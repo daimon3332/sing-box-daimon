@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.6.3"
+SCRIPT_VERSION="1.6.4"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -2191,19 +2191,41 @@ restart_sub_service() {
   systemctl is-active --quiet sing-box-sub
 }
 
+ca_certificates_ready() {
+  [[ -s /etc/ssl/certs/ca-certificates.crt ]]
+}
+
 lite_dependencies_ready() {
   local cmd
   if is_alpine; then
     for cmd in bash curl jq apk rc-service rc-update; do
       has_cmd "$cmd" || return 1
     done
-    [[ -s /etc/ssl/certs/ca-certificates.crt ]]
+    ca_certificates_ready
     return
   fi
   for cmd in curl tar gzip python3 ss; do
     has_cmd "$cmd" || return 1
   done
-  [[ -s /etc/ssl/certs/ca-certificates.crt ]]
+  ca_certificates_ready
+}
+
+standard_dependencies_ready() {
+  local cmd
+  for cmd in curl tar gzip python3 ss openssl; do
+    has_cmd "$cmd" || return 1
+  done
+  ca_certificates_ready
+}
+
+standard_missing_apt_packages() {
+  has_cmd curl || printf '%s\n' curl
+  has_cmd tar || printf '%s\n' tar
+  has_cmd gzip || printf '%s\n' gzip
+  has_cmd python3 || printf '%s\n' python3
+  has_cmd ss || printf '%s\n' iproute2
+  has_cmd openssl || printf '%s\n' openssl
+  ca_certificates_ready || printf '%s\n' ca-certificates
 }
 
 install_alpine_lite_dependencies() {
@@ -2339,8 +2361,8 @@ install_apt_lite_dependencies() {
 
 install_dependencies() {
   local mode="${1:-standard}"
-  local packages=(curl tar gzip python3 iproute2 ca-certificates openssl qrencode)
-  local rpm_packages=(curl tar gzip python3 iproute ca-certificates openssl qrencode)
+  local packages=()
+  local rpm_packages=(curl tar gzip python3 iproute ca-certificates openssl)
   if [[ "$mode" == "lite" ]]; then
     if lite_dependencies_ready; then
       info "NAT 必需依赖已齐全，跳过包管理器。"
@@ -2364,16 +2386,33 @@ install_dependencies() {
     }
     return 0
   fi
+  if standard_dependencies_ready; then
+    info "Sing-box 必需依赖已齐全，跳过包管理器。"
+    has_cmd qrencode || warn "未安装可选的 qrencode，仅无法在终端显示二维码，不影响节点使用。"
+    return 0
+  fi
   if has_cmd apt-get; then
-    apt-get update
-    apt-get install -y "${packages[@]}"
+    mapfile -t packages < <(standard_missing_apt_packages)
+    if ! apt-get update; then
+      warn "APT 索引更新失败，将使用已成功更新或现有的可信索引继续安装，不会降低签名验证。"
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get install -y "${packages[@]}"; then
+      fail "Sing-box 必需依赖安装失败。请修复上方报错的 APT 软件源后重试。"
+      return 1
+    fi
   elif has_cmd dnf; then
     dnf install -y "${rpm_packages[@]}"
   elif has_cmd yum; then
     yum install -y "${rpm_packages[@]}"
   else
-    warn "未识别包管理器，请确保 curl、tar、gzip、openssl、python3、ss、qrencode 已安装。"
+    fail "未识别包管理器，且 Sing-box 必需依赖不完整。"
+    return 1
   fi
+  standard_dependencies_ready || {
+    fail "Sing-box 必需依赖仍不完整，请检查 curl、tar、gzip、openssl、python3、ss 和 CA 证书。"
+    return 1
+  }
+  has_cmd qrencode || warn "未安装可选的 qrencode，仅无法在终端显示二维码，不影响节点使用。"
 }
 
 acme_bin() {
