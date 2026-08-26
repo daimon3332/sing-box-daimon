@@ -96,12 +96,13 @@ need_root() { :; }
 ensure_state() { :; }
 ensure_dirs() { :; }
 lite_mode() { return 1; }
+install_optional_qrencode() { refresh_calls+=(install_optional_qrencode); }
 managed_service_active() { return 1; }
 rebuild_configs() { refresh_calls+=(rebuild_configs); }
 write_sub_server() { refresh_calls+=(write_sub_server); }
 write_services() { [[ "${1:-}" == standard ]]; refresh_calls+=(write_services); }
 restart_sub_service() { refresh_calls+=(restart_sub_service); }
 refresh_installed
-[[ "${refresh_calls[*]}" == "rebuild_configs write_sub_server write_services restart_sub_service" ]]
+[[ "${refresh_calls[*]}" == "install_optional_qrencode rebuild_configs write_sub_server write_services restart_sub_service" ]]
 
 printf 'SUBSCRIPTION_COMPAT_TEST=PASS\n'

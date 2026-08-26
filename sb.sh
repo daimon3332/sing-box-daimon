@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.6.4"
+SCRIPT_VERSION="1.6.5"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -2228,6 +2228,22 @@ standard_missing_apt_packages() {
   ca_certificates_ready || printf '%s\n' ca-certificates
 }
 
+install_optional_qrencode() {
+  has_cmd qrencode && return 0
+  if has_cmd apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y qrencode || true
+  elif has_cmd dnf; then
+    dnf install -y qrencode || true
+  elif has_cmd yum; then
+    yum install -y qrencode || true
+  fi
+  if has_cmd qrencode; then
+    info "二维码工具 qrencode 已安装。"
+  else
+    warn "qrencode 安装失败，仅无法在终端显示二维码，不影响节点使用。"
+  fi
+}
+
 install_alpine_lite_dependencies() {
   local package tmp
   local required=(bash curl ca-certificates jq)
@@ -2388,7 +2404,7 @@ install_dependencies() {
   fi
   if standard_dependencies_ready; then
     info "Sing-box 必需依赖已齐全，跳过包管理器。"
-    has_cmd qrencode || warn "未安装可选的 qrencode，仅无法在终端显示二维码，不影响节点使用。"
+    install_optional_qrencode
     return 0
   fi
   if has_cmd apt-get; then
@@ -2412,7 +2428,7 @@ install_dependencies() {
     fail "Sing-box 必需依赖仍不完整，请检查 curl、tar、gzip、openssl、python3、ss 和 CA 证书。"
     return 1
   }
-  has_cmd qrencode || warn "未安装可选的 qrencode，仅无法在终端显示二维码，不影响节点使用。"
+  install_optional_qrencode
 }
 
 acme_bin() {
@@ -3155,6 +3171,7 @@ refresh_installed() {
     write_services lite
     return 0
   fi
+  install_optional_qrencode
   managed_service_active sing-box 2>/dev/null && sing_box_active=true
   rebuild_configs
   write_sub_server
