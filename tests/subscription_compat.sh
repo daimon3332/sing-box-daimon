@@ -31,6 +31,7 @@ EOF
 cat >"$STATE" <<'EOF'
 {
   "token": "compatToken",
+  "node_prefix": "Oracle",
   "sub_port": 2096,
   "sub_endpoint_host": "",
   "sub_domain": "",
@@ -60,6 +61,9 @@ PY
 )"
 [[ "$before_state" == "$after_state" ]]
 grep -Fq 'heartbeat-interval: 10000' "$SUB/clash.yaml"
+grep -Fq 'name: "Oracle-Hysteria-2"' "$SUB/clash.yaml"
+grep -Fq 'name: "Oracle-Tuic-v5"' "$SUB/clash.yaml"
+grep -Fq 'Oracle-Mixed-SOCKS5' "$SUB/clash.yaml"
 
 python3 - "$SUB/v2rayn_raw.txt" <<'PY'
 import base64, json, sys
@@ -77,13 +81,15 @@ assert items["v2rayn://tuic"]["AllowInsecure"] == "false"
 assert items["v2rayn://tuic"]["Cert"].startswith("-----BEGIN CERTIFICATE-----")
 assert items["v2rayn://hysteria2"]["CoreType"] == 24
 assert items["v2rayn://tuic"]["CoreType"] == 24
+assert items["v2rayn://hysteria2"]["Remarks"] == "Oracle-Hysteria-2"
+assert items["v2rayn://tuic"]["Remarks"] == "Oracle-Tuic-v5"
 
 socks = next(line for line in lines if line.startswith("socks://"))
 prefix, fragment = socks.split("#", 1)
 credentials, address = prefix[len("socks://"):].split("@", 1)
 assert base64.b64decode(credentials).decode() == "user:pass"
 assert address == "[2001:db8::10]:30000"
-assert fragment == "Mixed-SOCKS5"
+assert fragment == "Oracle-Mixed-SOCKS5"
 PY
 
 lite_mode() { return 1; }
