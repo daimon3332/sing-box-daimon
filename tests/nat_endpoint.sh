@@ -91,9 +91,9 @@ show_protocol_details() { :; }
 PUBLIC_IPS_DETECTED=false
 PUBLIC_IPS_CHECKED=0
 SAFE_READ_COUNT=0
-INPUTS=(ph2.1card.cc)
+INPUTS=(n ph2.1card.cc)
 add_all_protocols >/dev/null
-[[ "$SAFE_READ_COUNT" == "1" ]]
+[[ "$SAFE_READ_COUNT" == "2" ]]
 for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls; do
   [[ "$(proto_value "$proto" endpoint_host "")" == "ph2.1card.cc" ]]
   [[ "$(proto_value "$proto" ip_version "")" == "custom" ]]

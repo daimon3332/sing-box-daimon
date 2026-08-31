@@ -302,6 +302,7 @@ PY
 
 state_value() {
   local key="$1" default="${2:-}"
+  local state_cache_file="$ROOT/.state-cache.sh"
   [[ -s "$STATE" ]] || { printf '%s' "$default"; return; }
   if is_alpine; then
     jq -r --arg key "$key" --arg default "$default" '
@@ -310,25 +311,41 @@ state_value() {
     ' "$STATE" 2>/dev/null || printf '%s' "$default"
     return
   fi
-  python3 - "$STATE" "$key" "$default" <<'PY'
-import json, sys
-try:
-  data = json.load(open(sys.argv[1], encoding="utf-8"))
-except Exception:
-  print(sys.argv[3], end="")
-  raise SystemExit
-cur = data
-for part in sys.argv[2].split("."):
-  if isinstance(cur, dict) and part in cur:
-    cur = cur[part]
-  else:
-    print(sys.argv[3], end="")
-    raise SystemExit
-if isinstance(cur, bool):
-  print(str(cur).lower(), end="")
-else:
-  print(cur if cur is not None else sys.argv[3], end="")
+  if [[ ! -s "$state_cache_file" || "$STATE" -nt "$state_cache_file" ]]; then
+    local tmp
+    tmp="$(mktemp "$ROOT/.state-cache.XXXXXX")"
+    if ! python3 - "$STATE" <<'PY' >"$tmp"
+import json, shlex, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+def emit(value, path=()):
+    if isinstance(value, dict):
+        for key, item in value.items():
+            emit(item, path + (str(key),))
+    elif isinstance(value, (str, int, float, bool)) or value is None:
+        key = ".".join(path)
+        text = "" if value is None else (str(value).lower() if isinstance(value, bool) else str(value))
+        print(f"STATE_CACHE[{shlex.quote(key)}]={shlex.quote(text)}")
+emit(data)
 PY
+    then
+      rm -f "$tmp"
+      printf '%s' "$default"
+      return 0
+    fi
+    if [[ -s "$tmp" ]]; then
+      mv -f "$tmp" "$state_cache_file"
+    else
+      rm -f "$tmp"
+    fi
+  fi
+  local -A STATE_CACHE=()
+  [[ -r "$state_cache_file" ]] && source "$state_cache_file"
+  if [[ ${STATE_CACHE[$key]+_} ]]; then
+    printf '%s' "${STATE_CACHE[$key]}"
+  else
+    printf '%s' "$default"
+  fi
+  return
 }
 
 proto_value() {
@@ -449,6 +466,7 @@ set_state_value() {
       ($value | if $type == "number" then tonumber elif $type == "boolean" then . == "true" else . end) as $typed |
       setpath($path; $typed)
     ' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+    rm -f "$ROOT/.state-cache.sh"
     return
   fi
   python3 - "$STATE" "$key" "$value" <<'PY'
@@ -468,6 +486,7 @@ with open(path, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
 PY
+  rm -f "$ROOT/.state-cache.sh"
 }
 
 fetch_latest_script() {
@@ -501,11 +520,15 @@ with open(path, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
 PY
+  rm -f "$ROOT/.state-cache.sh"
 }
 
 refresh_version_cache_async() {
   is_alpine && ! has_cmd jq && return 0
-  ( refresh_version_cache ) >/dev/null 2>&1 &
+  local lock="${TMPDIR:-/tmp}/sing-box-daimon-version-refresh-${EUID:-$(id -u)}"
+  [[ -e "$lock" ]] && return 0
+  mkdir "$lock" 2>/dev/null || return 0
+  ( refresh_version_cache; rmdir "$lock" 2>/dev/null || true ) >/dev/null 2>&1 &
 }
 
 version_status() {
@@ -565,6 +588,7 @@ with open(path, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
 PY
+  rm -f "$ROOT/.state-cache.sh"
 }
 
 delete_protocol_state() {
@@ -585,6 +609,7 @@ with open(path, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
 PY
+  rm -f "$ROOT/.state-cache.sh"
 }
 
 hopping_comment() {
@@ -1419,6 +1444,47 @@ public_ipv6() {
   valid_ip_address "$ip" 6 && printf '%s' "$ip" || true
 }
 
+status_cache_dir() {
+  printf '%s/sing-box-daimon-%s' "${TMPDIR:-/tmp}" "${EUID:-$(id -u)}"
+}
+
+status_cache_fresh() {
+  local file="$1" ttl="${2:-21600}" now mtime
+  [[ -s "$file" ]] || return 1
+  now="$(date +%s)"
+  mtime="$(stat -c %Y "$file" 2>/dev/null || printf 0)"
+  [[ "$mtime" =~ ^[0-9]+$ ]] && (( now - mtime < ttl ))
+}
+
+refresh_status_network_async() {
+  local dir lock
+  dir="$(status_cache_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  lock="$dir/network.lock"
+  [[ -e "$lock" ]] && return 0
+  if status_cache_fresh "$dir/ipv4" && status_cache_fresh "$dir/ipv6"; then
+    return 0
+  fi
+  mkdir "$lock" 2>/dev/null || return 0
+  (
+    local tmp4="$dir/ipv4.tmp" tmp6="$dir/ipv6.tmp"
+    local pid4 pid6 value
+    ( value="$(public_ipv4)"; printf '%s' "${value:-未知}" >"$tmp4" ) & pid4=$!
+    ( value="$(public_ipv6)"; printf '%s' "${value:-未知}" >"$tmp6" ) & pid6=$!
+    wait "$pid4" 2>/dev/null || true
+    wait "$pid6" 2>/dev/null || true
+    mv -f "$tmp4" "$dir/ipv4" 2>/dev/null || true
+    mv -f "$tmp6" "$dir/ipv6" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+  ) &
+}
+
+status_cached_value() {
+  local name="$1" dir
+  dir="$(status_cache_dir)"
+  [[ -s "$dir/$name" ]] && cat "$dir/$name"
+}
+
 PUBLIC_IPS_DETECTED=false
 PUBLIC_IPS_CHECKED=0
 DETECTED_PUBLIC_IPV4=""
@@ -1429,14 +1495,20 @@ PROTOCOL_HOST=""
 PROTOCOL_URL_HOST=""
 
 detect_public_ips() {
-  local force="${1:-false}" now
+  local force="${1:-false}" now tmp pid4 pid6
   now="$(date +%s)"
   if [[ "$force" != "true" && "$PUBLIC_IPS_DETECTED" == "true" && "$PUBLIC_IPS_CHECKED" =~ ^[0-9]+$ ]] && (( now - PUBLIC_IPS_CHECKED <= 30 )); then
     [[ -n "$DETECTED_PUBLIC_IPV4" || -n "$DETECTED_PUBLIC_IPV6" ]]
     return
   fi
-  DETECTED_PUBLIC_IPV4="$(public_ipv4)"
-  DETECTED_PUBLIC_IPV6="$(public_ipv6)"
+  tmp="$(mktemp -d "${TMPDIR:-/tmp}/sing-box-daimon-ip.XXXXXX")"
+  ( public_ipv4 >"$tmp/ipv4" ) & pid4=$!
+  ( public_ipv6 >"$tmp/ipv6" ) & pid6=$!
+  wait "$pid4" 2>/dev/null || true
+  wait "$pid6" 2>/dev/null || true
+  DETECTED_PUBLIC_IPV4="$(<"$tmp/ipv4")"
+  DETECTED_PUBLIC_IPV6="$(<"$tmp/ipv6")"
+  rm -rf -- "$tmp"
   PUBLIC_IPS_DETECTED=true
   PUBLIC_IPS_CHECKED="$now"
   [[ -n "$DETECTED_PUBLIC_IPV4" || -n "$DETECTED_PUBLIC_IPV6" ]]
@@ -3650,10 +3722,38 @@ os_name() {
   fi
 }
 
-region_name() {
+fetch_region() {
   local text
   text="$(curl -fs --max-time 5 https://myip.ipip.net 2>/dev/null || true)"
   [[ -n "$text" ]] && printf '%s' "$text" | sed 's/^[^：:]*[：:] *//;s/[[:space:]]*$//' || printf '未知'
+}
+
+refresh_region_async() {
+  local dir lock cache
+  dir="$(status_cache_dir)"
+  cache="$dir/region"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  status_cache_fresh "$cache" && return 0
+  lock="$dir/region.lock"
+  [[ -e "$lock" ]] && return 0
+  mkdir "$lock" 2>/dev/null || return 0
+  (
+    local tmp="$cache.tmp"
+    fetch_region >"$tmp" 2>/dev/null || true
+    mv -f "$tmp" "$cache" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+  ) &
+}
+
+region_name() {
+  local dir cache
+  dir="$(status_cache_dir)"
+  cache="$dir/region"
+  if status_cache_fresh "$cache"; then
+    cat "$cache"
+  else
+    fetch_region
+  fi
 }
 
 sing_box_status() {
@@ -3667,21 +3767,29 @@ sing_box_status() {
 }
 
 show_status_header() {
-  local os kernel arch virt bbr qdisc ipv4 ipv6 region active
+  local os kernel arch virt bbr qdisc ipv4 ipv6 region active prefix
   os="$(os_name)"
   kernel="$(uname -r)"
   arch="$(uname -m)"
   virt="$(systemd-detect-virt 2>/dev/null || printf '未知')"
   bbr="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
   qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
-  ipv4="$(public_ipv4)"
-  ipv6="$(public_ipv6)"
-  region="$(region_name)"
+  refresh_status_network_async
+  refresh_region_async
+  ipv4="$(status_cached_value ipv4)"
+  ipv6="$(status_cached_value ipv6)"
+  region="$(status_cached_value region)"
   active="$(sing_box_status)"
+  prefix="$(node_prefix)"
   printf "${CYAN}系统:${NC}%s  ${CYAN}内核:${NC}%s  ${CYAN}处理器:${NC}%s  ${CYAN}虚拟化:${NC}%s  ${CYAN}BBR算法:${NC}%s ${CYAN}队列算法:${NC}%s\n" "$os" "$kernel" "$arch" "$virt" "$bbr" "$qdisc"
   printf "%s\n" "$(version_status)"
-  printf "${CYAN}出口IPV4地址:${NC}${MAGENTA}%s${NC}   ${CYAN}出口IPV6地址:${NC}%b\n" "${ipv4:-无IPV4}" "$(color_status "${ipv6:-无IPV6}")"
-  printf "${CYAN}服务器地区:${NC}${MAGENTA}%s${NC}\n" "${region:-未知}"
+  if [[ -n "$prefix" ]]; then
+    printf "${CYAN}节点名称前缀:${NC}${MAGENTA}%s${NC}\n" "$prefix"
+  else
+    printf "${CYAN}节点名称前缀:${NC}%b\n" "$(color_status 未设置)"
+  fi
+  printf "${CYAN}出口IPV4地址:${NC}${MAGENTA}%s${NC}   ${CYAN}出口IPV6地址:${NC}%b\n" "${ipv4:-检测中}" "$(color_status "${ipv6:-检测中}")"
+  printf "${CYAN}服务器地区:${NC}${MAGENTA}%s${NC}\n" "${region:-检测中}"
   printf "%s\n" "$(ufw_status_text)"
   printf "${CYAN}Sing-box状态:${NC}%b\n\n" "$(color_status "$active")"
 }

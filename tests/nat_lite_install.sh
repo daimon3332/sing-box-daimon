@@ -29,7 +29,7 @@ SERVICE="$CASE_ROOT/sing-box.service"
 SUB_SERVICE="$CASE_ROOT/sing-box-sub.service"
 mkdir -p "$ROOT"
 
-INPUTS=(nat.example.com)
+INPUTS=(n nat.example.com)
 SAFE_READ_COUNT=0
 DEPENDENCY_MODE=""
 DEPENDENCIES_READY=false
@@ -87,7 +87,7 @@ install_nat_lite >/dev/null
 
 [[ "$DEPENDENCY_MODE" == "lite" ]]
 [[ "$DOWNLOAD_MODE" == "lite" ]]
-[[ "$SAFE_READ_COUNT" == "1" ]]
+[[ "$SAFE_READ_COUNT" == "2" ]]
 [[ "$(state_value install_mode)" == "lite" ]]
 [[ "$(proto_value vless_reality enabled false)" == "true" ]]
 [[ "$(proto_value vless_reality endpoint_host "")" == "nat.example.com" ]]
