@@ -126,6 +126,43 @@ delete_protocol_state vless_reality
 [[ ! -e "$STATE.tmp" ]]
 "$PY" -c "import json,sys; json.load(open(sys.argv[1], encoding='utf-8'))" "$STATE"
 
-printf 'STATE_ATOMIC_TEST=PASS %s\n' "$(cat "$CASE_ROOT/race.out")"
+# Upgrade path: an older release wrote STATE_CACHE[...] assignments to
+# .state-cache.sh. Sourcing that from this version aborts under set -u because
+# the subscript is evaluated arithmetically, which broke the first read after
+# updating. The versioned filename must make the stale file irrelevant.
+printf "STATE_CACHE[token]='stale'\nSTATE_CACHE[sub_port]='9999'\n" >"$ROOT/.state-cache.sh"
+invalidate_state_cache
+set_state_value sub_port 4096
+[[ "$(state_value sub_port)" == 4096 ]]
+[[ "$(state_value token)" != stale ]]
+[[ -f "$ROOT/.state-cache.v2.sh" ]]
+
+# A cache file holding anything other than assignments must be rebuilt, never
+# executed, so a truncated or foreign file cannot run code or kill the script.
+printf 'echo PWNED\n' >"$ROOT/.state-cache.v2.sh"
+out="$(state_value sub_port)"
+[[ "$out" == 4096 ]]
+[[ "$out" != *PWNED* ]]
+
+# Invalidation must remove both the current and the legacy file.
+printf "STATE_CACHE[x]='y'\n" >"$ROOT/.state-cache.sh"
+invalidate_state_cache
+[[ ! -e "$ROOT/.state-cache.v2.sh" ]]
+[[ ! -e "$ROOT/.state-cache.sh" ]]
+
+# A write followed immediately by a read must not serve the pre-write value,
+# even within the same whole second that the mtime stamp records.
+for i in 1 2 3 4 5; do
+  set_state_value sub_port "$((5000 + i))"
+  [[ "$(state_value sub_port)" == "$((5000 + i))" ]]
+done
+
+# ensure_state must not rewrite state.json when the token is already valid;
+# it runs from most menu actions and each write cost an fsync plus a cache drop.
+before="$(stat -c %Y "$STATE")"
+sleep 1
+ensure_state
+after="$(stat -c %Y "$STATE")"
+[[ "$before" == "$after" ]]
 
 printf 'STATE_ATOMIC_TEST=PASS %s\n' "$(cat "$CASE_ROOT/race.out")"

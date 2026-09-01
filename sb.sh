@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.9.0"
+SCRIPT_VERSION="1.9.1"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -324,19 +324,28 @@ PY
 
 declare -gA SB_STATE_CACHE=()
 SB_STATE_CACHE_STAMP=""
+# The filename carries the emitted variable name. An older release wrote
+# STATE_CACHE[...] assignments here; sourcing that from this version aborts
+# under set -u because the subscript is evaluated arithmetically. Versioning the
+# path means a stale file is ignored instead of read, so updates are safe.
+SB_STATE_CACHE_FILE_NAME=".state-cache.v2.sh"
+
+state_cache_path() {
+  printf '%s/%s' "$ROOT" "$SB_STATE_CACHE_FILE_NAME"
+}
 
 # Writers must drop both the file and the in-process copy. The stamp uses
 # whole-second mtime, so a write plus rebuild inside one second could otherwise
 # match a stale stamp and serve outdated values.
 invalidate_state_cache() {
-  rm -f "$ROOT/.state-cache.sh"
+  rm -f "$(state_cache_path)" "$ROOT/.state-cache.sh"
   SB_STATE_CACHE=()
   SB_STATE_CACHE_STAMP=""
   return 0
 }
 
-# Regenerate $ROOT/.state-cache.sh when state.json is newer. Writers delete the
-# cache outright, so a missing file also forces a rebuild.
+# Regenerate the cache when state.json is newer. Writers delete the cache
+# outright, so a missing file also forces a rebuild.
 refresh_state_cache_file() {
   local state_cache_file="$1" tmp
   [[ ! -s "$state_cache_file" || "$STATE" -nt "$state_cache_file" ]] || return 0
@@ -373,14 +382,32 @@ PY
 # subshell inherits the parent's already-populated array, so one load per render
 # replaces one load per lookup.
 load_state_cache() {
-  local state_cache_file="$ROOT/.state-cache.sh" stamp
+  local state_cache_file="$ROOT/$SB_STATE_CACHE_FILE_NAME" line ok=1
+  # Fast path, taken by nearly every lookup: no subprocess at all. -nt and the
+  # array-size test are shell builtins. Spawning stat or grep here costs more
+  # than the sourcing this cache exists to avoid.
+  if [[ "$SB_STATE_CACHE_STAMP" == "$state_cache_file" ]] &&
+     ((${#SB_STATE_CACHE[@]})) && [[ ! "$STATE" -nt "$state_cache_file" ]]; then
+    return 0
+  fi
   refresh_state_cache_file "$state_cache_file" || return 1
-  stamp="$state_cache_file:$(stat -c %Y "$state_cache_file" 2>/dev/null || printf 0)"
-  [[ "$SB_STATE_CACHE_STAMP" == "$stamp" ]] && return 0
-  SB_STATE_CACHE=()
   [[ -r "$state_cache_file" ]] || return 1
+  # Validate only when actually loading. Anything that is not an
+  # SB_STATE_CACHE[...]=... assignment is rebuilt rather than executed, so a
+  # truncated or foreign file cannot run code or abort the script under set -u.
+  while IFS= read -r line; do
+    [[ -z "$line" || "$line" == 'SB_STATE_CACHE['*']='* ]] || { ok=0; break; }
+  done <"$state_cache_file"
+  if (( ok == 0 )); then
+    rm -f "$state_cache_file"
+    refresh_state_cache_file "$state_cache_file" || return 1
+    while IFS= read -r line; do
+      [[ -z "$line" || "$line" == 'SB_STATE_CACHE['*']='* ]] || return 1
+    done <"$state_cache_file"
+  fi
+  SB_STATE_CACHE=()
   source "$state_cache_file" || return 1
-  SB_STATE_CACHE_STAMP="$stamp"
+  SB_STATE_CACHE_STAMP="$state_cache_file"
   return 0
 }
 
