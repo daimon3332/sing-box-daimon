@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SB_PATH="${SB_PATH:-$REPO_ROOT/sb.sh}"
+eval "$(sed -n '/^core_download_url() {/,/^}/p' "$SB_PATH")"
 eval "$(sed -n '/^download_core() {/,/^}/p' "$SB_PATH")"
 
 CASE_ROOT="$(mktemp -d)"

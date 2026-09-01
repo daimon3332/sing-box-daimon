@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.8.1"
+SCRIPT_VERSION="1.9.0"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -251,8 +251,9 @@ ensure_state() {
     if ! valid_token "$token"; then
       tmp="$(mktemp "$ROOT/.state.XXXXXX")"
       jq --arg token "$(rand_hex 16)" '.token = $token' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
+      invalidate_state_cache
     fi
-    return
+    return 0
   fi
   if [[ ! -s "$STATE" ]]; then
     python3 - "$STATE" <<'PY'
@@ -277,22 +278,32 @@ with open(tmp, "w", encoding="utf-8") as f:
 os.replace(tmp, path)
 PY
   fi
-  python3 - "$STATE" <<'PY' >/dev/null 2>&1 || true
+  # Only rewrite when the token is actually invalid. This used to save()
+  # unconditionally, so every ensure_state call cost a write plus fsync and
+  # invalidated the state cache, and ensure_state runs from rebuild_configs,
+  # generate_subscription and most menu actions. Exit 10 signals "rotated".
+  local rc=0
+  python3 - "$STATE" <<'PY' >/dev/null 2>&1 || rc=$?
 import json, os, re, secrets, sys
 path = sys.argv[1]
 data = json.load(open(path, encoding="utf-8"))
-if not re.fullmatch(r"[A-Za-z0-9]+", str(data.get("token", ""))):
-  data["token"] = secrets.token_hex(16)
-def save(path, data):
-  tmp = path + ".tmp"
-  with open(tmp, "w", encoding="utf-8") as f:
-    json.dump(data, f, indent=2, ensure_ascii=False)
-    f.write("\n")
-    f.flush()
-    os.fsync(f.fileno())
-  os.replace(tmp, path)
-save(path, data)
+if re.fullmatch(r"[A-Za-z0-9]+", str(data.get("token", ""))):
+  raise SystemExit(0)
+data["token"] = secrets.token_hex(16)
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+  json.dump(data, f, indent=2, ensure_ascii=False)
+  f.write("\n")
+  f.flush()
+  os.fsync(f.fileno())
+os.replace(tmp, path)
+raise SystemExit(10)
 PY
+  # A rotated token must drop the cached copy, otherwise callers keep the old
+  # token and generate_subscription writes files under a name that no longer
+  # matches state.json.
+  (( rc == 10 )) && invalidate_state_cache
+  return 0
 }
 
 has_protocols() {
@@ -311,21 +322,26 @@ raise SystemExit(0 if any(v.get("enabled") for v in data.get("protocols", {}).va
 PY
 }
 
-state_value() {
-  local key="$1" default="${2:-}"
-  local state_cache_file="$ROOT/.state-cache.sh"
-  [[ -s "$STATE" ]] || { printf '%s' "$default"; return; }
-  if is_alpine; then
-    jq -r --arg key "$key" --arg default "$default" '
-      try (getpath($key | split(".")) // $default) catch $default |
-      if type == "boolean" then tostring else tostring end
-    ' "$STATE" 2>/dev/null || printf '%s' "$default"
-    return
-  fi
-  if [[ ! -s "$state_cache_file" || "$STATE" -nt "$state_cache_file" ]]; then
-    local tmp
-    tmp="$(mktemp "$ROOT/.state-cache.XXXXXX")"
-    if ! python3 - "$STATE" <<'PY' >"$tmp"
+declare -gA SB_STATE_CACHE=()
+SB_STATE_CACHE_STAMP=""
+
+# Writers must drop both the file and the in-process copy. The stamp uses
+# whole-second mtime, so a write plus rebuild inside one second could otherwise
+# match a stale stamp and serve outdated values.
+invalidate_state_cache() {
+  rm -f "$ROOT/.state-cache.sh"
+  SB_STATE_CACHE=()
+  SB_STATE_CACHE_STAMP=""
+  return 0
+}
+
+# Regenerate $ROOT/.state-cache.sh when state.json is newer. Writers delete the
+# cache outright, so a missing file also forces a rebuild.
+refresh_state_cache_file() {
+  local state_cache_file="$1" tmp
+  [[ ! -s "$state_cache_file" || "$STATE" -nt "$state_cache_file" ]] || return 0
+  tmp="$(mktemp "$ROOT/.state-cache.XXXXXX")" || return 1
+  if ! python3 - "$STATE" <<'PY' >"$tmp"
 import json, shlex, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 def emit(value, path=()):
@@ -335,28 +351,56 @@ def emit(value, path=()):
     elif isinstance(value, (str, int, float, bool)) or value is None:
         key = ".".join(path)
         text = "" if value is None else (str(value).lower() if isinstance(value, bool) else str(value))
-        print(f"STATE_CACHE[{shlex.quote(key)}]={shlex.quote(text)}")
+        print(f"SB_STATE_CACHE[{shlex.quote(key)}]={shlex.quote(text)}")
 emit(data)
 PY
-    then
-      rm -f "$tmp"
-      printf '%s' "$default"
-      return 0
-    fi
-    if [[ -s "$tmp" ]]; then
-      mv -f "$tmp" "$state_cache_file"
-    else
-      rm -f "$tmp"
-    fi
+  then
+    rm -f "$tmp"
+    return 1
   fi
-  local -A STATE_CACHE=()
-  [[ -r "$state_cache_file" ]] && source "$state_cache_file"
-  if [[ ${STATE_CACHE[$key]+_} ]]; then
-    printf '%s' "${STATE_CACHE[$key]}"
+  if [[ -s "$tmp" ]]; then
+    mv -f "$tmp" "$state_cache_file"
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+  return 0
+}
+
+# Source the cache into a process-global array at most once per cache mtime.
+# state_value is called ~180x per menu render, almost all inside command
+# substitutions; re-sourcing the file each time cost ~2.2 ms per call. A
+# subshell inherits the parent's already-populated array, so one load per render
+# replaces one load per lookup.
+load_state_cache() {
+  local state_cache_file="$ROOT/.state-cache.sh" stamp
+  refresh_state_cache_file "$state_cache_file" || return 1
+  stamp="$state_cache_file:$(stat -c %Y "$state_cache_file" 2>/dev/null || printf 0)"
+  [[ "$SB_STATE_CACHE_STAMP" == "$stamp" ]] && return 0
+  SB_STATE_CACHE=()
+  [[ -r "$state_cache_file" ]] || return 1
+  source "$state_cache_file" || return 1
+  SB_STATE_CACHE_STAMP="$stamp"
+  return 0
+}
+
+state_value() {
+  local key="$1" default="${2:-}"
+  [[ -s "$STATE" ]] || { printf '%s' "$default"; return 0; }
+  if is_alpine; then
+    jq -r --arg key "$key" --arg default "$default" '
+      try (getpath($key | split(".")) // $default) catch $default |
+      if type == "boolean" then tostring else tostring end
+    ' "$STATE" 2>/dev/null || printf '%s' "$default"
+    return 0
+  fi
+  load_state_cache || { printf '%s' "$default"; return 0; }
+  if [[ ${SB_STATE_CACHE[$key]+_} ]]; then
+    printf '%s' "${SB_STATE_CACHE[$key]}"
   else
     printf '%s' "$default"
   fi
-  return
+  return 0
 }
 
 proto_value() {
@@ -477,7 +521,7 @@ set_state_value() {
       ($value | if $type == "number" then tonumber elif $type == "boolean" then . == "true" else . end) as $typed |
       setpath($path; $typed)
     ' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
-    rm -f "$ROOT/.state-cache.sh"
+    invalidate_state_cache
     return
   fi
   python3 - "$STATE" "$key" "$value" <<'PY'
@@ -501,7 +545,7 @@ with open(tmp, "w", encoding="utf-8") as f:
   os.fsync(f.fileno())
 os.replace(tmp, path)
 PY
-  rm -f "$ROOT/.state-cache.sh"
+  invalidate_state_cache
 }
 
 fetch_latest_script() {
@@ -539,7 +583,7 @@ with open(tmp, "w", encoding="utf-8") as f:
   os.fsync(f.fileno())
 os.replace(tmp, path)
 PY
-  rm -f "$ROOT/.state-cache.sh"
+  invalidate_state_cache
 }
 
 refresh_version_cache_async() {
@@ -611,7 +655,7 @@ with open(tmp, "w", encoding="utf-8") as f:
   os.fsync(f.fileno())
 os.replace(tmp, path)
 PY
-  rm -f "$ROOT/.state-cache.sh"
+  invalidate_state_cache
 }
 
 delete_protocol_state() {
@@ -636,7 +680,7 @@ with open(tmp, "w", encoding="utf-8") as f:
   os.fsync(f.fileno())
 os.replace(tmp, path)
 PY
-  rm -f "$ROOT/.state-cache.sh"
+  invalidate_state_cache
 }
 
 hopping_comment() {
@@ -871,10 +915,29 @@ allow_missing_ufw_ports() {
   return "$failed"
 }
 
+# The hopping rule REDIRECTs a whole UDP range to one port, so any other
+# UDP-carrying protocol whose port falls inside the range stops receiving
+# traffic. Report the collisions instead of silently breaking those nodes.
+hopping_range_conflicts() {
+  local owner="$1" start="$2" end="$3" proto port
+  for proto in mixed hysteria2 tuic; do
+    [[ "$proto" == "$owner" ]] && continue
+    [[ "$(proto_value "$proto" enabled false)" == "true" ]] || continue
+    port="$(proto_value "$proto" port "")"
+    [[ "$port" =~ ^[0-9]+$ ]] || continue
+    (( port >= start && port <= end )) && printf '%s(%s) ' "$proto" "$port"
+  done
+  return 0
+}
+
 ask_hopping() {
-  local proto="$1" current_start="${2:-}" current_end="${3:-}" range start end default_yn=n
+  local proto="$1" current_start="${2:-}" current_end="${3:-}" range start end default_yn=n conflicts
   [[ -n "$current_start" && -n "$current_end" ]] && default_yn=y
-  ask_yes_no "是否开启 ${proto} 跳跃端口？" "$default_yn" || { printf '\t\t'; return; }
+  # Both emissions must end in a newline. Without it `read` hits EOF and returns
+  # 1, which under set -e aborted the caller: adding Hysteria-2 individually and
+  # changing its hop range both died right after this prompt, leaving the
+  # protocol unwritten.
+  ask_yes_no "是否开启 ${proto} 跳跃端口？" "$default_yn" || { printf '\t\n'; return 0; }
   while true; do
     safe_read "请输入跳跃端口范围，格式 48000:50000${current_start:+ [$current_start:$current_end]}: " range
     range="${range:-${current_start:+$current_start:$current_end}}"
@@ -882,10 +945,17 @@ ask_hopping() {
       range="${range/-/:}"
       start="${range%%:*}"
       end="${range##*:}"
-      printf '%s\t%s' "$start" "$end"
-      return
+      conflicts="$(hopping_range_conflicts "$proto" "$start" "$end")"
+      if [[ -n "$conflicts" ]]; then
+        warn "该范围包含其他协议的 UDP 端口，会导致这些节点收不到流量: ${conflicts% }" >&2
+        continue
+      fi
+      printf '%s\t%s\n' "$start" "$end"
+      return 0
     fi
-    warn "端口范围格式错误。"
+    # stdout is this function's return channel, read by the caller. A message
+    # written here would be consumed as the port values instead of shown.
+    warn "端口范围格式错误。" >&2
   done
 }
 
@@ -989,9 +1059,9 @@ ask_port() {
     safe_read "$name 端口 [$port]: " input
     input="${input:-$port}"
     if ! valid_port "$input"; then
-      warn "端口范围必须是 1-65535。"
+      warn "端口范围必须是 1-65535。" >&2
     elif port_used "$input" "$exclude"; then
-      warn "端口 $input 已占用，请重新输入。"
+      warn "端口 $input 已占用，请重新输入。" >&2
     else
       printf '%s' "$input"
       return
@@ -1008,7 +1078,8 @@ ask_menu() {
   while true; do
     safe_read "$prompt" input
     [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 0 && input <= max )) && { printf '%s' "$input"; return; }
-    warn "请输入 0-$max 的数字。"
+    # stdout is the return channel; a message here becomes the caller's value.
+    warn "请输入 0-$max 的数字。" >&2
   done
 }
 
@@ -1029,7 +1100,7 @@ pick_sni() {
         safe_read "请输入 SNI [${current:-www.bing.com}]: " custom
         custom="${custom:-${current:-www.bing.com}}"
         valid_domain "$custom" && { printf '%s' "$custom"; return; }
-        warn "SNI 请输入有效域名。"
+        warn "SNI 请输入有效域名。" >&2
       done
       ;;
     *) printf '%s' "${SNI_OPTIONS[0]}" ;;
@@ -1858,6 +1929,7 @@ PY
 generate_subscription() {
   ensure_state
   ensure_dirs
+  load_state_cache || true
   local token raw v2rayn_raw sub_file ipv4 ipv6 pin prefix
   detect_public_ips || true
   if protocols_require_detected_host && [[ -z "$DETECTED_PUBLIC_IPV4" && -z "$DETECTED_PUBLIC_IPV6" ]]; then
@@ -2913,6 +2985,30 @@ arch_name() {
   esac
 }
 
+# The unauthenticated GitHub API allows 60 requests/hour per IP, which a shared
+# or NAT address can exhaust, making installs fail with no usable error. Fall
+# back to resolving the /releases/latest redirect, which has no such limit.
+core_download_url() {
+  local arch="$1" url version redirect
+  url="$(curl -fsSL --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null |
+    grep browser_download_url |
+    grep "linux-$arch.tar.gz" |
+    grep -v '\.asc' |
+    head -n1 |
+    cut -d '"' -f4 || true)"
+  if [[ -n "$url" ]]; then
+    printf '%s' "$url"
+    return 0
+  fi
+  redirect="$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 15 \
+    https://github.com/SagerNet/sing-box/releases/latest 2>/dev/null || true)"
+  version="${redirect##*/tag/v}"
+  [[ -n "$version" && "$version" != "$redirect" && "$version" =~ ^[0-9][0-9A-Za-z.\-]*$ ]] || return 0
+  printf 'https://github.com/SagerNet/sing-box/releases/download/v%s/sing-box-%s-linux-%s.tar.gz' \
+    "$version" "$version" "$arch"
+  return 0
+}
+
 download_core() {
   local mode="${1:-standard}" arch url tmp file lib stale
   if is_alpine; then
@@ -3007,15 +3103,10 @@ download_core() {
     fail "无法创建 sing-box 下载目录。"
     return 1
   }
-  url="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest |
-    grep browser_download_url |
-    grep "linux-$arch.tar.gz" |
-    grep -v '\.asc' |
-    head -n1 |
-    cut -d '"' -f4)"
+  url="$(core_download_url "$arch")"
   if [[ -z "$url" ]]; then
     rm -rf "$tmp"
-    fail "未找到 sing-box 下载地址。"
+    fail "未找到 sing-box 下载地址。请确认网络可访问 GitHub 后重试。"
     return 1
   fi
   if [[ "$mode" == "lite" ]]; then
@@ -4245,6 +4336,7 @@ show_protocols() {
 }
 
 show_protocol_details() {
+  load_state_cache || true
   if lite_mode; then
     title "NAT 轻量 VLESS Reality 节点链接如下："
   else
@@ -4300,6 +4392,10 @@ run_manage() {
 main_menu() {
   while true; do
     clear_screen
+    # Load once in this shell so the ~180 lookups below, which all run inside
+    # command substitutions, inherit a populated array instead of each
+    # re-sourcing the cache file.
+    load_state_cache || true
     show_status_header
     show_protocols
     printf "\n"
