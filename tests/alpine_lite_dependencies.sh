@@ -7,6 +7,15 @@ source "$REPO_ROOT/sb.sh"
 CASE_ROOT="$(mktemp -d)"
 trap 'rm -rf "$CASE_ROOT"' EXIT
 ROOT="$CASE_ROOT/root"
+# ensure_dirs uses these globals, not $ROOT/..., so every one must be
+# redirected or the test creates the real /etc/sing-box tree on the host.
+CONF="$ROOT/conf"
+CERT="$ROOT/cert"
+SUB="$ROOT/sub"
+LOG="$ROOT/log"
+FIREWALL="$ROOT/firewall"
+UFW_RULES="$FIREWALL/ufw.rules"
+STATE="$ROOT/state.json"
 ALPINE_PACKAGES="$ROOT/alpine-packages"
 JQ_INSTALLED=false
 APK_ADD_ARGS=""

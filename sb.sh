@@ -256,7 +256,7 @@ ensure_state() {
   fi
   if [[ ! -s "$STATE" ]]; then
     python3 - "$STATE" <<'PY'
-import json, secrets, sys
+import json, os, secrets, sys
 state = {
   "token": secrets.token_hex(16),
   "node_prefix": "",
@@ -267,20 +267,31 @@ state = {
   "install_mode": "standard",
   "protocols": {}
 }
-with open(sys.argv[1], "w", encoding="utf-8") as f:
+path = sys.argv[1]
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
   json.dump(state, f, indent=2, ensure_ascii=False)
   f.write("\n")
+  f.flush()
+  os.fsync(f.fileno())
+os.replace(tmp, path)
 PY
   fi
   python3 - "$STATE" <<'PY' >/dev/null 2>&1 || true
-import json, re, secrets, sys
+import json, os, re, secrets, sys
 path = sys.argv[1]
 data = json.load(open(path, encoding="utf-8"))
 if not re.fullmatch(r"[A-Za-z0-9]+", str(data.get("token", ""))):
   data["token"] = secrets.token_hex(16)
-with open(path, "w", encoding="utf-8") as f:
-  json.dump(data, f, indent=2, ensure_ascii=False)
-  f.write("\n")
+def save(path, data):
+  tmp = path + ".tmp"
+  with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+    f.flush()
+    os.fsync(f.fileno())
+  os.replace(tmp, path)
+save(path, data)
 PY
 }
 
@@ -470,7 +481,7 @@ set_state_value() {
     return
   fi
   python3 - "$STATE" "$key" "$value" <<'PY'
-import json, sys
+import json, os, sys
 path, key, value = sys.argv[1], sys.argv[2].split("."), sys.argv[3]
 data = json.load(open(path, encoding="utf-8"))
 cur = data
@@ -482,9 +493,13 @@ elif value in {"true", "false"}:
   cur[key[-1]] = value == "true"
 else:
   cur[key[-1]] = value
-with open(path, "w", encoding="utf-8") as f:
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
+  f.flush()
+  os.fsync(f.fileno())
+os.replace(tmp, path)
 PY
   rm -f "$ROOT/.state-cache.sh"
 }
@@ -506,7 +521,7 @@ refresh_version_cache() {
     return
   fi
   python3 - "$STATE" "$latest" "$now" <<'PY' >/dev/null 2>&1 || true
-import json, sys
+import json, os, sys
 path, latest, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
 try:
   data = json.load(open(path, encoding="utf-8"))
@@ -516,9 +531,13 @@ version = data.setdefault("version", {})
 if latest:
   version["latest"] = latest
 version["checked"] = now
-with open(path, "w", encoding="utf-8") as f:
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
+  f.flush()
+  os.fsync(f.fileno())
+os.replace(tmp, path)
 PY
   rm -f "$ROOT/.state-cache.sh"
 }
@@ -571,7 +590,7 @@ set_protocol() {
     return
   fi
   python3 - "$STATE" "$proto" "$@" <<'PY'
-import json, sys
+import json, os, sys
 path, proto, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
 data = json.load(open(path, encoding="utf-8"))
 item = data.setdefault("protocols", {}).setdefault(proto, {})
@@ -584,9 +603,13 @@ for pair in pairs:
     item[key] = value == "true"
   else:
     item[key] = value
-with open(path, "w", encoding="utf-8") as f:
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
+  f.flush()
+  os.fsync(f.fileno())
+os.replace(tmp, path)
 PY
   rm -f "$ROOT/.state-cache.sh"
 }
@@ -601,13 +624,17 @@ delete_protocol_state() {
     return
   fi
   python3 - "$STATE" "$proto" <<'PY'
-import json, sys
+import json, os, sys
 path, proto = sys.argv[1], sys.argv[2]
 data = json.load(open(path, encoding="utf-8"))
 data.setdefault("protocols", {}).pop(proto, None)
-with open(path, "w", encoding="utf-8") as f:
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
   json.dump(data, f, indent=2, ensure_ascii=False)
   f.write("\n")
+  f.flush()
+  os.fsync(f.fileno())
+os.replace(tmp, path)
 PY
   rm -f "$ROOT/.state-cache.sh"
 }
@@ -1029,7 +1056,7 @@ PY
 }
 
 ensure_cert() {
-  local names san primary ext missing=0
+  local names san primary ext name missing=0
   ensure_dirs
   mapfile -t names < <(cert_names | awk 'NF && !seen[$0]++')
   primary="${names[0]:-${SNI_OPTIONS[0]}}"
@@ -2131,6 +2158,26 @@ PY
   cp "$SUB/v2rayn.txt" "$SUB/$token.v2rayn"
   cp "$SUB/clash.yaml" "$SUB/$token.clash"
   cp "$raw" "$SUB/$token.raw"
+  prune_stale_token_files "$token"
+}
+
+# Token-named copies persist until explicitly deleted. The menu removes the
+# previous set when the user changes the token, but ensure_state also rotates an
+# invalid token, which would leave the old subscription readable on disk. Prune
+# on every generation so only the active token's files remain.
+prune_stale_token_files() {
+  local token="$1" path base
+  [[ -d "$SUB" ]] || return 0
+  for path in "$SUB"/*; do
+    [[ -f "$path" ]] || continue
+    base="${path##*/}"
+    case "$base" in
+      raw.txt|sub.txt|clash.yaml|v2rayn.txt|v2rayn_raw.txt) continue ;;
+      "$token"|"$token".v2rayn|"$token".clash|"$token".raw) continue ;;
+    esac
+    rm -f -- "$path"
+  done
+  return 0
 }
 
 show_qr() {
@@ -3318,7 +3365,7 @@ uninstall_sing_box() {
   rm -f "$SERVICE" "$SUB_SERVICE"
   is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
   rm -rf "$ROOT/bin" "$CONF" "$CERT" "$SUB" "$LOG"
-  rm -f "$STATE" "$SUB_SERVER"
+  rm -f "$STATE" "$STATE.tmp" "$SUB_SERVER"
   remove_alpine_managed_packages false
   ensure_dirs
   info "Sing-box 和所有协议已卸载，管理脚本已保留。"
@@ -3400,7 +3447,11 @@ refresh_installed() {
     managed_service_restart sing-box >/dev/null 2>&1 || return 1
     managed_service_active sing-box || return 1
   fi
-  restart_sub_service
+  # A slow subscription bind must not fail the whole refresh: update_script
+  # treats a nonzero status as "update failed" even though configs, services
+  # and the core were all applied successfully.
+  restart_sub_service || warn "订阅服务重启较慢或失败，请在运行管理中查看状态。"
+  return 0
 }
 
 legacy_subscription_needs_refresh() {
