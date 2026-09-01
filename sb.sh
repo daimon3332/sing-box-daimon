@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.9.2"
+SCRIPT_VERSION="1.9.3"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -727,11 +727,12 @@ delete_hopping_rules() {
 
 apply_hopping_rules() {
   local proto="$1" start="$2" end="$3" target="$4" comment
-  [[ -n "$start" && -n "$end" ]] || return 0
   comment="$(hopping_comment "$proto")"
   delete_hopping_rules "$proto"
-  iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null || true
-  ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+  if [[ -n "$start" && -n "$end" ]]; then
+    iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+    ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+  fi
 }
 
 save_firewall_rules() {
