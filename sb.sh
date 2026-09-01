@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="1.8.0"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -719,6 +719,7 @@ delete_protocol_ufw_rules() {
 
 managed_ufw_rules() {
   [[ -s "$UFW_RULES" ]] && awk 'NF && !seen[$0]++' "$UFW_RULES"
+  return 0
 }
 
 rule_in_list() {
@@ -1483,6 +1484,7 @@ status_cached_value() {
   local name="$1" dir
   dir="$(status_cache_dir)"
   [[ -s "$dir/$name" ]] && cat "$dir/$name"
+  return 0
 }
 
 PUBLIC_IPS_DETECTED=false
@@ -2160,6 +2162,7 @@ write_sub_server() {
 import http.server
 import json
 import pathlib
+import socket
 import socketserver
 from urllib.parse import urlparse
 
@@ -2167,9 +2170,21 @@ ROOT = pathlib.Path("$ROOT")
 STATE = ROOT / "state.json"
 SUB = ROOT / "sub"
 
+def read_state():
+    try:
+        with open(STATE, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
 class Handler(http.server.BaseHTTPRequestHandler):
     def send_subscription(self, send_body=True):
-        token = json.load(open(STATE, encoding="utf-8")).get("token", "")
+        token = read_state().get("token", "")
+        if not token:
+            self.send_response(503)
+            self.end_headers()
+            return
         path = urlparse(self.path).path.strip("/")
         ua = self.headers.get("User-Agent", "").lower()
         default_file = "clash.yaml" if ("clash" in ua or "mihomo" in ua) else "sub.txt"
@@ -2191,7 +2206,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
             return
         file_name, content_type = variants[path]
-        data = (SUB / file_name).read_bytes()
+        try:
+            data = (SUB / file_name).read_bytes()
+        except OSError:
+            self.send_response(404)
+            self.end_headers()
+            return
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Cache-Control", "no-store")
@@ -2207,9 +2227,33 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 class ReuseTCPServer(socketserver.ThreadingTCPServer):
     allow_reuse_address = True
+    daemon_threads = True
 
-port = int(json.load(open(STATE, encoding="utf-8")).get("sub_port", 2096))
-with ReuseTCPServer(("0.0.0.0", port), Handler) as httpd:
+# Dual-stack: bind :: with V6ONLY off so one socket serves IPv4 and IPv6.
+# IPv6-only VPS links are generated as http://[addr]:port/..., which a
+# 0.0.0.0-only socket can never answer. Fall back to IPv4 if IPv6 is absent.
+class DualStackTCPServer(ReuseTCPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except (AttributeError, OSError):
+            pass
+        ReuseTCPServer.server_bind(self)
+
+try:
+    port = int(read_state().get("sub_port", 2096))
+except (TypeError, ValueError):
+    port = 2096
+if not 1 <= port <= 65535:
+    port = 2096
+
+try:
+    httpd = DualStackTCPServer(("::", port), Handler)
+except OSError:
+    httpd = ReuseTCPServer(("0.0.0.0", port), Handler)
+with httpd:
     httpd.serve_forever()
 EOF
   chmod +x "$SUB_SERVER"
@@ -3766,6 +3810,312 @@ sing_box_status() {
   fi
 }
 
+SYSCTL_TUNE_FILE="/etc/sysctl.d/99-zz-sing-box-daimon.conf"
+
+memory_total_mb() {
+  awk '/^MemTotal:/ { print int($2 / 1024); exit }' /proc/meminfo 2>/dev/null || printf 0
+}
+
+tune_buffer_max() {
+  local mb
+  mb="$(memory_total_mb)"
+  [[ "$mb" =~ ^[0-9]+$ ]] || mb=0
+  if (( mb < 512 )); then
+    printf '16777216'
+  elif (( mb < 1024 )); then
+    printf '33554432'
+  elif (( mb < 2048 )); then
+    printf '67108864'
+  else
+    printf '134217728'
+  fi
+}
+
+tune_backlog() {
+  local mb
+  mb="$(memory_total_mb)"
+  [[ "$mb" =~ ^[0-9]+$ ]] || mb=0
+  if (( mb < 512 )); then
+    printf '2048'
+  elif (( mb < 2048 )); then
+    printf '8192'
+  else
+    printf '16384'
+  fi
+}
+
+sysctl_read() {
+  sysctl -n "$1" 2>/dev/null || true
+}
+
+cc_available() {
+  local want="$1" list
+  list="$(sysctl_read net.ipv4.tcp_available_congestion_control)"
+  [[ " $list " == *" $want "* ]] && return 0
+  modprobe "tcp_$want" >/dev/null 2>&1 || return 1
+  list="$(sysctl_read net.ipv4.tcp_available_congestion_control)"
+  [[ " $list " == *" $want "* ]]
+}
+
+sysctl_writable() {
+  local key=net.ipv4.tcp_mtu_probing current
+  current="$(sysctl_read "$key")"
+  [[ -n "$current" ]] || return 1
+  sysctl -w "$key=$current" >/dev/null 2>&1
+}
+
+qdisc_available() {
+  local want="$1"
+  has_cmd tc || return 1
+  grep -q "^sch_$want " /proc/modules 2>/dev/null && return 0
+  modprobe "sch_$want" >/dev/null 2>&1 && return 0
+  [[ -n "$(find "/lib/modules/$(uname -r)/kernel/net/sched" -name "sch_$want.ko*" -print -quit 2>/dev/null)" ]] && return 0
+  [[ "$want" == "$(sysctl_read net.core.default_qdisc)" ]]
+}
+
+tunable_interfaces() {
+  local name
+  while read -r name; do
+    [[ -n "$name" ]] || continue
+    case "$name" in
+      lo|docker*|veth*|br-*|virbr*|tun*|tap*|wg*|sit*|gre*|ip6tnl*|dummy*|bond*.*|*@*) continue ;;
+    esac
+    printf '%s\n' "$name"
+  done < <(ip -o link show up 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}')
+  return 0
+}
+
+interface_root_qdisc() {
+  tc qdisc show dev "$1" 2>/dev/null |
+    awk '{ for (i = 1; i <= NF; i++) if ($i == "root") { print $2; exit } }'
+}
+
+interface_parent_handles() {
+  tc qdisc show dev "$1" 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "parent") { print $(i + 1); break } }'
+}
+
+interface_leaf_qdisc() {
+  tc qdisc show dev "$1" 2>/dev/null |
+    awk '{ for (i = 1; i < NF; i++) if ($i == "parent") { print $2; exit } }'
+}
+
+interface_tx_queues() {
+  local count
+  count="$(find "/sys/class/net/$1/queues" -maxdepth 1 -name 'tx-*' -printf '.' 2>/dev/null | wc -c)"
+  [[ "$count" =~ ^[0-9]+$ ]] && (( count > 0 )) || count=0
+  printf '%s' "$count"
+}
+
+# A multi-queue root prints its handle as "0:", which tc cannot address, so
+# "parent :1" and "del root" both fail. Assigning an explicit handle makes the
+# kernel rebuild the per-queue children from net.core.default_qdisc, and the
+# children can then be set individually. This keeps mq parallelism intact;
+# replacing the root outright would discard it.
+apply_interface_qdisc() {
+  local iface="$1" want="$2" root leaf queues i applied=0
+  root="$(interface_root_qdisc "$iface")"
+  leaf="$(interface_leaf_qdisc "$iface")"
+  if [[ "$root" == "$want" ]] || [[ -n "$leaf" && "$leaf" == "$want" ]]; then
+    printf 'ok'
+    return 0
+  fi
+  if [[ "$root" == "mq" || "$root" == "mqprio" ]]; then
+    if tc qdisc replace dev "$iface" root handle 1: "$root" >/dev/null 2>&1; then
+      queues="$(interface_tx_queues "$iface")"
+      for ((i = 1; i <= queues; i++)); do
+        tc qdisc replace dev "$iface" parent "1:$i" "$want" >/dev/null 2>&1 && applied=1
+      done
+      if (( applied == 1 )) || [[ "$(interface_leaf_qdisc "$iface")" == "$want" ]]; then
+        printf 'child'
+        return 0
+      fi
+    fi
+  fi
+  if tc qdisc replace dev "$iface" root "$want" >/dev/null 2>&1; then
+    printf 'root'
+  else
+    printf 'fail'
+  fi
+  return 0
+}
+
+effective_qdisc_label() {
+  local configured iface root leaf mismatch=0 seen=0
+  configured="$(sysctl_read net.core.default_qdisc)"
+  [[ -n "$configured" ]] || { printf '未知'; return 0; }
+  has_cmd tc || { printf '%s' "$configured"; return 0; }
+  while read -r iface; do
+    [[ -n "$iface" ]] || continue
+    seen=1
+    root="$(interface_root_qdisc "$iface")"
+    if [[ "$root" == "mq" || "$root" == "mqprio" ]]; then
+      leaf="$(interface_leaf_qdisc "$iface")"
+      [[ -z "$leaf" || "$leaf" == "$configured" ]] || mismatch=1
+    elif [[ -n "$root" && "$root" != "$configured" ]]; then
+      mismatch=1
+    fi
+  done < <(tunable_interfaces)
+  if (( seen == 1 && mismatch == 1 )); then
+    printf '%s(未生效)' "$configured"
+  else
+    printf '%s' "$configured"
+  fi
+  return 0
+}
+
+sysctl_conflict_files() {
+  local key file
+  local -a keys=("$@")
+  while IFS= read -r file; do
+    [[ -f "$file" ]] || continue
+    [[ "$file" != "$SYSCTL_TUNE_FILE" ]] || continue
+    for key in "${keys[@]}"; do
+      if grep -Eq "^[[:space:]]*${key//./\\.}[[:space:]]*=" "$file" 2>/dev/null; then
+        printf '%s\n' "$file"
+        break
+      fi
+    done
+  done < <(printf '%s\n' /etc/sysctl.conf /etc/sysctl.d/*.conf /run/sysctl.d/*.conf /usr/lib/sysctl.d/*.conf 2>/dev/null)
+  return 0
+}
+
+write_sysctl_tune_file() {
+  local cc="$1" qdisc="$2" bufmax="$3" backlog="$4"
+  cat >"$SYSCTL_TUNE_FILE" <<EOF
+# sing-box-daimon network tuning. Managed file, safe to delete.
+net.core.default_qdisc = $qdisc
+net.ipv4.tcp_congestion_control = $cc
+net.core.rmem_max = $bufmax
+net.core.wmem_max = $bufmax
+net.ipv4.tcp_rmem = 4096 131072 $bufmax
+net.ipv4.tcp_wmem = 4096 16384 $bufmax
+net.core.netdev_max_backlog = $backlog
+net.core.somaxconn = 8192
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_mtu_probing = 1
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 1
+net.ipv4.udp_rmem_min = 8192
+net.ipv4.udp_wmem_min = 8192
+EOF
+}
+
+network_tune_status() {
+  local cc qdisc iface root leaf bufmax
+  title "当前网络状态"
+  cc="$(sysctl_read net.ipv4.tcp_congestion_control)"
+  qdisc="$(sysctl_read net.core.default_qdisc)"
+  bufmax="$(sysctl_read net.core.rmem_max)"
+  printf "${CYAN}拥塞控制:${NC}%s  ${CYAN}默认队列:${NC}%s  ${CYAN}接收缓冲上限:${NC}%s\n" \
+    "${cc:-未知}" "${qdisc:-未知}" "${bufmax:-未知}"
+  printf "${CYAN}可用拥塞控制:${NC}%s\n" "$(sysctl_read net.ipv4.tcp_available_congestion_control)"
+  printf "${CYAN}内存:${NC}%s MB  ${CYAN}托管配置:${NC}%s\n" \
+    "$(memory_total_mb)" "$([[ -f "$SYSCTL_TUNE_FILE" ]] && printf '已写入' || printf '未写入')"
+  if has_cmd tc; then
+    printf "${CYAN}网卡实际队列:${NC}\n"
+    while read -r iface; do
+      [[ -n "$iface" ]] || continue
+      root="$(interface_root_qdisc "$iface")"
+      if [[ "$root" == "mq" || "$root" == "mqprio" ]]; then
+        leaf="$(interface_leaf_qdisc "$iface")"
+        printf "  %s: %s -> %s\n" "$iface" "$root" "${leaf:-未知}"
+      else
+        printf "  %s: %s\n" "$iface" "${root:-未知}"
+      fi
+    done < <(tunable_interfaces)
+  else
+    warn "未安装 tc(iproute2)，无法查看或修改网卡实际队列。"
+  fi
+  return 0
+}
+
+apply_network_tuning() {
+  local cc=bbr qdisc=fq bufmax backlog conflicts=() file iface result
+  local applied_cc applied_qdisc ok=1 changed_iface=0
+  need_root
+  if ! sysctl_writable; then
+    fail "当前环境不允许修改内核参数(常见于非特权容器)，无法优化。"
+    return 1
+  fi
+  if ! cc_available bbr; then
+    warn "内核不支持 BBR，将保留当前拥塞控制算法。"
+    cc="$(sysctl_read net.ipv4.tcp_congestion_control)"
+    [[ -n "$cc" ]] || cc=cubic
+  fi
+  if ! has_cmd tc; then
+    warn "未安装 tc(iproute2)，仅写入 sysctl，网卡队列需重启后生效。"
+  elif ! qdisc_available fq; then
+    warn "内核不支持 fq 队列，将使用 fq_codel。"
+    qdisc=fq_codel
+  fi
+  bufmax="$(tune_buffer_max)"
+  backlog="$(tune_backlog)"
+  mapfile -t conflicts < <(sysctl_conflict_files net.core.default_qdisc net.ipv4.tcp_congestion_control net.core.rmem_max net.core.wmem_max)
+  write_sysctl_tune_file "$cc" "$qdisc" "$bufmax" "$backlog"
+  if ! sysctl -p "$SYSCTL_TUNE_FILE" >/dev/null 2>&1; then
+    warn "sysctl 应用过程中有参数被拒绝，将逐项校验实际生效值。"
+  fi
+  applied_cc="$(sysctl_read net.ipv4.tcp_congestion_control)"
+  applied_qdisc="$(sysctl_read net.core.default_qdisc)"
+  [[ "$applied_cc" == "$cc" ]] || { fail "拥塞控制设置失败：期望 $cc，实际 ${applied_cc:-未知}。"; ok=0; }
+  [[ "$applied_qdisc" == "$qdisc" ]] || { fail "默认队列设置失败：期望 $qdisc，实际 ${applied_qdisc:-未知}。"; ok=0; }
+  if has_cmd tc; then
+    while read -r iface; do
+      [[ -n "$iface" ]] || continue
+      result="$(apply_interface_qdisc "$iface" "$qdisc")"
+      case "$result" in
+        ok) info "网卡 $iface 已是 $qdisc。" ;;
+        root) info "网卡 $iface 根队列已切换为 $qdisc。"; changed_iface=1 ;;
+        child) info "网卡 $iface 多队列子队列已切换为 $qdisc。"; changed_iface=1 ;;
+        *) warn "网卡 $iface 队列切换失败，重启后由 sysctl 生效。" ;;
+      esac
+    done < <(tunable_interfaces)
+  fi
+  if ((${#conflicts[@]})); then
+    warn "检测到其他 sysctl 文件也设置了相同参数，本脚本文件按字典序最后加载并已生效："
+    for file in "${conflicts[@]}"; do
+      printf "  %s\n" "$file"
+    done
+  fi
+  info "拥塞控制: $applied_cc   默认队列: $applied_qdisc   缓冲上限: $(sysctl_read net.core.rmem_max)"
+  (( changed_iface == 1 )) && info "网卡队列已即时生效，无需重启。"
+  if (( ok == 1 )); then
+    info "网络自适应优化完成。配置文件: $SYSCTL_TUNE_FILE"
+    return 0
+  fi
+  fail "部分参数未生效，请检查上方提示。"
+  return 1
+}
+
+revert_network_tuning() {
+  need_root
+  if [[ ! -f "$SYSCTL_TUNE_FILE" ]]; then
+    warn "未找到本脚本写入的优化配置，无需还原。"
+    return 0
+  fi
+  rm -f "$SYSCTL_TUNE_FILE"
+  sysctl --system >/dev/null 2>&1 || true
+  info "已删除 $SYSCTL_TUNE_FILE 并重新加载系统 sysctl 配置。"
+  info "网卡实际队列将在重启后完全恢复系统默认。"
+  return 0
+}
+
+network_tools_menu() {
+  while true; do
+    clear_screen
+    title "系统工具：网络自适应优化"
+    network_tune_status
+    printf "\n1. 应用网络自适应优化(BBR + 队列 + 缓冲，按内存自动取值)\n2. 还原本脚本的优化配置\n0. 返回上一界面\n"
+    case "$(ask_menu "请选择: " 2)" in
+      1) apply_network_tuning || true; pause ;;
+      2) revert_network_tuning || true; pause ;;
+      0) return 0 ;;
+    esac
+  done
+}
+
 show_status_header() {
   local os kernel arch virt bbr qdisc ipv4 ipv6 region active prefix
   os="$(os_name)"
@@ -3773,7 +4123,7 @@ show_status_header() {
   arch="$(uname -m)"
   virt="$(systemd-detect-virt 2>/dev/null || printf '未知')"
   bbr="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || printf '未知')"
-  qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || printf '未知')"
+  qdisc="$(effective_qdisc_label)"
   refresh_status_network_async
   refresh_region_async
   ipv4="$(status_cached_value ipv4)"
@@ -3883,14 +4233,14 @@ run_manage() {
     title "Sing-box运行管理"
     printf "1. 启动 Sing-box\n2. 停止 Sing-box\n3. 重启 Sing-box\n4. 查看状态\n5. 查看日志\n6. 开机自启\n7. 关闭开机自启\n8. 检查配置\n0. 返回上一界面\n"
     case "$(ask_menu "请选择: " 8)" in
-      1) for service in "${services[@]}"; do managed_service_start "$service"; done; info "已启动。"; pause ;;
-      2) for service in "${services[@]}"; do managed_service_stop "$service"; done; info "已停止。"; pause ;;
-      3) for service in "${services[@]}"; do managed_service_restart "$service"; done; info "已重启。"; pause ;;
-      4) managed_service_status sing-box; pause ;;
-      5) if is_alpine; then tail -n 80 "$LOG/sing-box.log" 2>/dev/null || true; else journalctl -u sing-box -n 80 --no-pager; fi; pause ;;
-      6) for service in "${services[@]}"; do managed_service_enable_only "$service"; done; info "已开启开机自启。"; pause ;;
-      7) for service in "${services[@]}"; do managed_service_disable_only "$service"; done; info "已关闭开机自启。"; pause ;;
-      8) "$BIN" check -C "$CONF"; pause ;;
+      1) for service in "${services[@]}"; do managed_service_start "$service" || warn "$service 启动失败。"; done; info "已启动。"; pause ;;
+      2) for service in "${services[@]}"; do managed_service_stop "$service" || warn "$service 停止失败。"; done; info "已停止。"; pause ;;
+      3) for service in "${services[@]}"; do managed_service_restart "$service" || warn "$service 重启失败。"; done; info "已重启。"; pause ;;
+      4) managed_service_status sing-box || true; pause ;;
+      5) if is_alpine; then tail -n 80 "$LOG/sing-box.log" 2>/dev/null || true; else journalctl -u sing-box -n 80 --no-pager || true; fi; pause ;;
+      6) for service in "${services[@]}"; do managed_service_enable_only "$service" || warn "$service 开机自启设置失败。"; done; info "已开启开机自启。"; pause ;;
+      7) for service in "${services[@]}"; do managed_service_disable_only "$service" || warn "$service 关闭开机自启失败。"; done; info "已关闭开机自启。"; pause ;;
+      8) "$BIN" check -C "$CONF" || true; pause ;;
       0) return ;;
     esac
   done
@@ -3920,11 +4270,12 @@ main_menu() {
     menu_line 11 "更改综合订阅配置"
     menu_line 12 "一键放行所有缺失端口"
     menu_line 14 "设置节点名称前缀"
-    case "$(ask_menu "请选择: " 14)" in
-      1) update_script; pause ;;
-      2) delete_script ;;
-      3) install_sing_box; pause ;;
-      4) uninstall_sing_box; pause ;;
+    menu_line 15 "系统工具：网络自适应优化"
+    case "$(ask_menu "请选择: " 15)" in
+      1) update_script || true; pause ;;
+      2) delete_script || true ;;
+      3) install_sing_box || true; pause ;;
+      4) uninstall_sing_box || true; pause ;;
       5) run_manage ;;
       6) add_all_protocols && restart_if_running; pause ;;
       7) add_protocol_menu && pause ;;
@@ -3932,9 +4283,10 @@ main_menu() {
       9) delete_protocol_menu && pause ;;
       10) view_protocols ;;
       11) change_subscription_config && pause ;;
-      12) allow_missing_ufw_ports; pause ;;
-      13) install_nat_lite; pause ;;
-      14) node_prefix_menu; pause ;;
+      12) allow_missing_ufw_ports || true; pause ;;
+      13) install_nat_lite || true; pause ;;
+      14) node_prefix_menu || true; pause ;;
+      15) network_tools_menu ;;
       0) exit 0 ;;
     esac
   done
