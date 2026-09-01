@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.9.1"
+SCRIPT_VERSION="1.9.2"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -4467,6 +4467,10 @@ main_menu() {
 }
 
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  # A cache file left by an older release holds STATE_CACHE[...] assignments.
+  # This version never reads that name, but removing it means a downgrade or a
+  # re-run of the intermediate release cannot abort on it under set -u.
+  rm -f "$ROOT/.state-cache.sh" 2>/dev/null || true
   case "${1:-}" in
     --refresh-installed) refresh_installed ;;
     *)
