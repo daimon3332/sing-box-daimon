@@ -90,4 +90,52 @@ ask_yes_no() { return 0; }
 IFS=$'\t' read -r hop_start hop_end < <(printf '40000:50000\n20000:21000\n' | ask_hopping "Hysteria-2" 2>/dev/null)
 [[ "$hop_start" == "20000" && "$hop_end" == "21000" ]]
 
+# Exhausted stdin must terminate, not hang or kill the script. Under set -e a
+# failing read aborted the whole run at a pause prompt, and the retry loops that
+# ignored the failure spun forever once stdin was closed.
+pause </dev/null
+
+menu_eof="$(ask_menu "choose: " 15 </dev/null 2>/dev/null)"
+[[ "$menu_eof" == "0" ]]
+
+timeout 5 bash -c '
+  set -Eeuo pipefail
+  source "$1/sb.sh"
+  ask_menu "choose: " 15 >/dev/null 2>&1
+' _ "$REPO_ROOT" </dev/null
+
+# Every helper reading stdin in a retry loop must terminate at EOF. Each runs in
+# its own process so an abort cannot take the harness with it; only a hang
+# (timeout 124) is a failure, since returning nonzero back to the menu is valid.
+for fn in \
+  "choose_node_ip_version" \
+  "shared_custom_endpoint_host" \
+  "maybe_set_node_prefix" \
+  "ask_port Test 443 443" \
+  "pick_sni" \
+  ; do
+  timeout 5 bash -c '
+    set -Eeuo pipefail
+    source "$1/sb.sh"
+    shift
+    "$@" >/dev/null 2>&1
+  ' _ "$REPO_ROOT" $fn </dev/null >/dev/null 2>&1 || rc=$?
+  [[ "${rc:-0}" != "124" ]] || { printf 'hang at EOF: %s\n' "$fn" >&2; exit 1; }
+  rc=0
+done
+
+# EOF at a destructive confirmation must read as "no". Treating an exhausted
+# stdin as consent would uninstall the service or delete the script outright.
+destructive="$(timeout 5 bash -c '
+  set -Eeuo pipefail
+  source "$1/sb.sh"
+  need_root() { return 0; }
+  state_value() { printf ""; }
+  managed_service_disable_now() { printf "CONSENTED\n"; }
+  remove_subscription_nginx_and_cert() { printf "CONSENTED\n"; }
+  uninstall_sing_box 2>/dev/null || true
+  delete_script 2>/dev/null || true
+' _ "$REPO_ROOT" </dev/null 2>/dev/null | grep -c 'CONSENTED' || true)"
+[[ "$destructive" == "0" ]]
+
 printf 'INPUT_CAPTURE_TEST=PASS\n'

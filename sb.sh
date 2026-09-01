@@ -69,15 +69,15 @@ clear_screen() {
 safe_read() {
   stty erase '^?' 2>/dev/null || true
   if [[ -t 0 ]]; then
-    read -r -e -p "$1" "$2"
+    read -r -e -p "$1" "$2" || return 1
   else
-    read -r -p "$1" "$2"
+    read -r -p "$1" "$2" || return 1
   fi
 }
 
 pause() {
   local _
-  safe_read "按回车继续..." _
+  safe_read "按回车继续..." _ || true
 }
 
 is_root() {
@@ -145,17 +145,19 @@ b64_url() {
 
 ask_text() {
   local prompt="$1" default="${2:-}" value
-  safe_read "$prompt [$default]: " value
+  # EOF leaves value empty, so the default applies. Swallowing the read failure
+  # keeps set -e from killing the script at an unanswerable prompt.
+  safe_read "$prompt [$default]: " value || true
   printf '%s' "${value:-$default}"
 }
 
 ask_yes_no() {
   local prompt="$1" default="${2:-n}" value
   if [[ "$default" =~ ^[Yy]$ ]]; then
-    safe_read "$prompt [Y/n]: " value
+    safe_read "$prompt [Y/n]: " value || true
     value="${value:-y}"
   else
-    safe_read "$prompt [y/N]: " value
+    safe_read "$prompt [y/N]: " value || true
     value="${value:-n}"
   fi
   [[ "$value" =~ ^[Yy]$ ]]
@@ -483,7 +485,9 @@ maybe_set_node_prefix() {
   ask_yes_no "是否设置节点名称前缀？" y || return 0
   local value
   while true; do
-    safe_read "请输入节点名称前缀: " value
+    # Prefixes are optional, so an unanswerable prompt just leaves it unset
+    # rather than aborting the install midway.
+    safe_read "请输入节点名称前缀: " value || return 0
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
     if set_node_prefix "$value"; then
@@ -505,7 +509,7 @@ node_prefix_menu() {
   case "$choice" in
     1)
       while true; do
-        safe_read "请输入节点名称前缀: " value
+        safe_read "请输入节点名称前缀: " value || return 1
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
         if set_node_prefix "$value"; then
@@ -967,7 +971,9 @@ ask_hopping() {
   # protocol unwritten.
   ask_yes_no "是否开启 ${proto} 跳跃端口？" "$default_yn" || { printf '\t\n'; return 0; }
   while true; do
-    safe_read "请输入跳跃端口范围，格式 48000:50000${current_start:+ [$current_start:$current_end]}: " range
+    # EOF here means no range can be collected; emit the same empty pair as
+    # declining so the caller writes the protocol without hopping.
+    safe_read "请输入跳跃端口范围，格式 48000:50000${current_start:+ [$current_start:$current_end]}: " range || { printf '\t\n'; return 0; }
     range="${range:-${current_start:+$current_start:$current_end}}"
     if valid_port_range "$range"; then
       range="${range/-/:}"
@@ -1084,7 +1090,9 @@ ask_port() {
   local name="$1" default="$2" exclude="${3:-}" port input
   port="$(next_free_port "$default" "$exclude")"
   while true; do
-    safe_read "$name 端口 [$port]: " input
+    # stdout is the return channel, so fall back to the pre-checked free port on
+    # EOF instead of aborting or looping on a closed stdin.
+    safe_read "$name 端口 [$port]: " input || { printf '%s' "$port"; return; }
     input="${input:-$port}"
     if ! valid_port "$input"; then
       warn "端口范围必须是 1-65535。" >&2
@@ -1104,7 +1112,10 @@ protocol_exists() {
 ask_menu() {
   local prompt="$1" max="$2" input
   while true; do
-    safe_read "$prompt" input
+    # On EOF (piped input exhausted, or Ctrl-D) fall back to 0, the "return" /
+    # "exit" choice every caller has. Retrying instead spun forever, since a
+    # closed stdin never yields a valid number.
+    safe_read "$prompt" input || { printf '0'; return; }
     [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 0 && input <= max )) && { printf '%s' "$input"; return; }
     # stdout is the return channel; a message here becomes the caller's value.
     warn "请输入 0-$max 的数字。" >&2
@@ -1125,7 +1136,7 @@ pick_sni() {
     3) printf '%s' "${SNI_OPTIONS[2]}" ;;
     4)
       while true; do
-        safe_read "请输入 SNI [${current:-www.bing.com}]: " custom
+        safe_read "请输入 SNI [${current:-www.bing.com}]: " custom || true
         custom="${custom:-${current:-www.bing.com}}"
         valid_domain "$custom" && { printf '%s' "$custom"; return; }
         warn "SNI 请输入有效域名。" >&2
@@ -1650,7 +1661,9 @@ choose_node_ip_version() {
   if [[ -n "$DETECTED_PUBLIC_IPV4" && -n "$DETECTED_PUBLIC_IPV6" ]]; then
     printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 检测到的 IPv6  %s\n3. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
     while true; do
-      safe_read "请选择 [1-3]: " choice
+      # No address can be chosen without input, and every caller guards this
+      # with `|| return 1`, so EOF aborts the add instead of spinning.
+      safe_read "请选择 [1-3]: " choice || return 1
       case "$choice" in
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
         2) SELECTED_IP_VERSION=ipv6; return 0 ;;
@@ -1661,7 +1674,7 @@ choose_node_ip_version() {
   elif [[ -n "$DETECTED_PUBLIC_IPV4" ]]; then
     printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV4" >&2
     while true; do
-      safe_read "请选择 [1-2]: " choice
+      safe_read "请选择 [1-2]: " choice || return 1
       case "$choice" in
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
         2) break ;;
@@ -1671,7 +1684,7 @@ choose_node_ip_version() {
   elif [[ -n "$DETECTED_PUBLIC_IPV6" ]]; then
     printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv6  %s\n2. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV6" >&2
     while true; do
-      safe_read "请选择 [1-2]: " choice
+      safe_read "请选择 [1-2]: " choice || return 1
       case "$choice" in
         1) SELECTED_IP_VERSION=ipv6; return 0 ;;
         2) break ;;
@@ -1682,7 +1695,7 @@ choose_node_ip_version() {
     warn "未检测到可用的公网 IPv4 或 IPv6，请手动输入客户端连接地址。" >&2
   fi
   while true; do
-    safe_read "请输入客户端连接 IPv4、IPv6 或域名: " input
+    safe_read "请输入客户端连接 IPv4、IPv6 或域名: " input || return 1
     if SELECTED_ENDPOINT_HOST="$(endpoint_host_value "$input")"; then
       SELECTED_IP_VERSION=custom
       return 0
@@ -3201,7 +3214,8 @@ install_shortcuts() {
   if [[ -e /usr/local/bin/sing-box && ! "$(readlink -f /usr/local/bin/sing-box 2>/dev/null || true)" == "$SCRIPT" ]]; then
     local yn
     warn "/usr/local/bin/sing-box 已存在，可能不是本脚本管理。"
-    safe_read "是否覆盖为管理脚本快捷命令？[y/N]: " yn
+    # EOF must never read as consent: leave the existing symlink alone.
+    safe_read "是否覆盖为管理脚本快捷命令？[y/N]: " yn || return 0
     [[ "$yn" =~ ^[Yy]$ ]] || return 0
   fi
   ln -sf "$SCRIPT" /usr/local/bin/sing-box
@@ -3472,7 +3486,8 @@ remove_alpine_managed_packages() {
 uninstall_sing_box() {
   need_root
   local yn
-  safe_read "确认删除所有协议并卸载 Sing-box？管理脚本会保留。[y/N]: " yn
+  # An unanswerable prompt must not be treated as confirmation to uninstall.
+  safe_read "确认删除所有协议并卸载 Sing-box？管理脚本会保留。[y/N]: " yn || return 0
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
   managed_service_disable_now sing-box
   managed_service_disable_now sing-box-sub
@@ -3493,7 +3508,7 @@ uninstall_sing_box() {
 delete_script() {
   need_root
   local yn
-  safe_read "确认删除脚本、所有协议和 Sing-box？此操作不可恢复。[y/N]: " yn
+  safe_read "确认删除脚本、所有协议和 Sing-box？此操作不可恢复。[y/N]: " yn || return 0
   [[ "$yn" =~ ^[Yy]$ ]] || return 0
   managed_service_disable_now sing-box
   managed_service_disable_now sing-box-sub
@@ -3833,7 +3848,8 @@ change_subscription_config() {
     2)
       old_token="$(state_value token)"
       while true; do
-        safe_read "请输入新 token，直接回车随机生成: " input
+        # Empty input means "generate one", which EOF satisfies too.
+        safe_read "请输入新 token，直接回车随机生成: " input || true
         new_token="${input:-$(rand_token)}"
         if valid_token "$new_token"; then
           break
@@ -3848,7 +3864,8 @@ change_subscription_config() {
       ;;
     3)
       while true; do
-        safe_read "请输入 HTTPS 订阅域名: " domain
+        # No domain can be guessed, so EOF backs out to the menu.
+        safe_read "请输入 HTTPS 订阅域名: " domain || return 1
         if [[ -n "$domain" ]] && valid_domain "$domain"; then
           break
         fi
@@ -3862,7 +3879,7 @@ change_subscription_config() {
       ;;
     5)
       while true; do
-        safe_read "请输入 HTTP/IP 订阅连接 IPv4、IPv6 或域名，直接回车恢复自动: " input
+        safe_read "请输入 HTTP/IP 订阅连接 IPv4、IPv6 或域名，直接回车恢复自动: " input || return 1
         if [[ -z "$input" ]]; then
           set_state_value sub_endpoint_host ""
           info "HTTP/IP 订阅连接地址已恢复自动选择。"
@@ -3888,7 +3905,8 @@ delete_protocol_menu() {
   local input item proto yn protocols=() deleted=0
   title "删除协议"
   printf "1. Mixed\n2. Vless-reality\n3. Vmess-ws\n4. Hysteria-2\n5. Tuic-v5\n6. Anytls\n7. Trojan\n8. Shadowsocks\n9. Vmess-tcp\n10. Vmess-http\n11. 删除所有协议\n0. 返回\n"
-  safe_read "请选择，可多选，如 1 3 5 或 1,3,5: " input
+  # EOF behaves like the documented "0. 返回" choice.
+  safe_read "请选择，可多选，如 1 3 5 或 1,3,5: " input || return 1
   input="${input//,/ }"
   [[ "$input" =~ (^|[[:space:]])0($|[[:space:]]) ]] && return 1
   if [[ "$input" =~ (^|[[:space:]])11($|[[:space:]]) ]]; then
@@ -3912,7 +3930,8 @@ delete_protocol_menu() {
     done
   fi
   ((${#protocols[@]} > 0)) || return 1
-  safe_read "确认删除选中的 ${#protocols[@]} 个协议？[y/N]: " yn
+  # EOF must never read as consent to delete protocols.
+  safe_read "确认删除选中的 ${#protocols[@]} 个协议？[y/N]: " yn || return 1
   [[ "$yn" =~ ^[Yy]$ ]] || return 1
   for proto in "${protocols[@]}"; do
     if protocol_exists "$proto"; then
