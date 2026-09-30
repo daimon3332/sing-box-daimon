@@ -795,8 +795,12 @@ apply_hopping_rules() {
   comment="$(hopping_comment "$proto")"
   delete_hopping_rules "$proto"
   if [[ -n "$start" && -n "$end" ]]; then
-    iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null || true
-    ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null || true
+    iptables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null ||
+      warn "IPv4 跳跃端口规则写入失败，跳跃端口不可用。" >&2
+    if host_has_ipv6; then
+      ip6tables -t nat -A PREROUTING -p udp --dport "$start:$end" -m comment --comment "$comment" -j REDIRECT --to-ports "$target" 2>/dev/null ||
+        warn "IPv6 跳跃端口规则写入失败，IPv6 跳跃端口不可用。" >&2
+    fi
   fi
 }
 
@@ -2951,7 +2955,17 @@ lite_dependencies_ready() {
   for cmd in curl tar gzip python3 ss; do
     has_cmd "$cmd" || return 1
   done
+  ! dpkg_python_broken || return 1
   ca_certificates_ready
+}
+
+# An older NAT installer could leave python3 unpacked but unconfigured. The
+# binary still runs, yet every later apt-get stops on unmet dependencies.
+dpkg_python_broken() {
+  local status
+  has_cmd dpkg-query || return 1
+  status="$(dpkg-query -W -f='${db:Status-Abbrev}' python3 2>/dev/null || true)"
+  [[ -n "$status" && "$status" != ii* ]]
 }
 
 standard_dependencies_ready() {
@@ -2959,6 +2973,7 @@ standard_dependencies_ready() {
   for cmd in curl tar gzip python3 ss openssl; do
     has_cmd "$cmd" || return 1
   done
+  ! dpkg_python_broken || return 1
   ca_certificates_ready
 }
 
@@ -2966,10 +2981,28 @@ standard_missing_apt_packages() {
   has_cmd curl || printf '%s\n' curl
   has_cmd tar || printf '%s\n' tar
   has_cmd gzip || printf '%s\n' gzip
-  has_cmd python3 || printf '%s\n' python3
+  has_cmd python3 && ! dpkg_python_broken || printf '%s\n' python3
   has_cmd ss || printf '%s\n' iproute2
   has_cmd openssl || printf '%s\n' openssl
   ca_certificates_ready || printf '%s\n' ca-certificates
+}
+
+# Hopping is a NAT REDIRECT; minimal Debian 12 images ship nftables without the
+# iptables front end, and the rules used to fail silently.
+ensure_hopping_tools() {
+  has_cmd iptables && return 0
+  info "跳跃端口需要 iptables，正在安装..." >&2
+  if has_cmd apt-get; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y iptables >&2 ||
+      { apt-get update >&2 && DEBIAN_FRONTEND=noninteractive apt-get install -y iptables >&2; } || true
+  elif has_cmd dnf; then
+    dnf install -y iptables >&2 || true
+  elif has_cmd yum; then
+    yum install -y iptables >&2 || true
+  fi
+  has_cmd iptables && return 0
+  fail "iptables 安装失败，无法开启跳跃端口。" >&2
+  return 1
 }
 
 install_optional_qrencode() {
@@ -3019,40 +3052,82 @@ install_alpine_lite_dependencies() {
   }
 }
 
+debian_dep_satisfied() {
+  local name="$1" op="${2:-}" want="${3:-}" status version
+  status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$name" 2>/dev/null || true)"
+  [[ "$status" == ii* ]] || return 1
+  [[ -n "$op" ]] || return 0
+  version="$(dpkg-query -W -f='${Version}' "$name" 2>/dev/null)" || return 1
+  dpkg --compare-versions "$version" "$op" "$want"
+}
+
+# Candidates for one dependency name: the package itself, else its providers.
+debian_dep_candidates() {
+  awk -F'\t' -v n="$2" '
+    $1 == n { print $1; found = 1; exit }
+    { k = split($5, p, /, */); for (i = 1; i <= k; i++) { sub(/ .*/, "", p[i]); if (p[i] == n) prov[++c] = $1 } }
+    END { if (!found) for (i = 1; i <= c; i++) print prov[i] }
+  ' "$1"
+}
+
+# A fixed package list broke whenever the base image lacked one dependency
+# (Debian 12 minimal has no libnsl2/libtirpc3), leaving python3 unconfigured.
+# Resolve the python3 closure from the streamed index instead; apt-get update
+# is what NAT machines with 64 MB cannot afford.
 download_debian_lite_packages() {
-  local cache="$1" arch codename base index package filename checksum status target
+  local cache="$1" arch codename base index pkg line filename checksum deps group alt name op want cand target resolved
+  local queue=(python3) seen=" " groups alts candidates
   arch="$(dpkg --print-architecture)"
   codename="$(. /etc/os-release; printf '%s' "${VERSION_CODENAME:-}")"
   [[ -n "$arch" && -n "$codename" ]] || return 1
   base="https://deb.debian.org/debian"
-  index="$cache/Packages.selected"
-  if ! curl -fLsS --limit-rate 2M "$base/dists/$codename/main/binary-$arch/Packages.gz" |
-    gzip -dc |
-    awk 'BEGIN { RS=""; ORS="\n\n" }
-      $0 ~ /^Package: (python3|python3-minimal|libpython3-stdlib|python3\.[0-9]+|python3\.[0-9]+-minimal|libpython3\.[0-9]+-minimal|libpython3\.[0-9]+-stdlib|libexpat1|libssl3t64|libssl3|media-types|netbase|tzdata|libbz2-1\.0|libc6|libdb5\.3t64|libdb5\.3|libffi8|liblzma5|libncursesw6|libreadline[0-9]+t64|libreadline[0-9]+|libsqlite3-0|libtinfo6|libuuid1|zlib1g|readline-common|dpkg)\n/ { print }
-    ' >"$index"; then
-    return 1
-  fi
-  grep -q '^Package: python3$' "$index" || return 1
-  while IFS=$'\t' read -r package filename checksum; do
-    [[ -n "$package" && -n "$filename" && -n "$checksum" ]] || continue
-    status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$package" 2>/dev/null || true)"
-    [[ "$status" == ii* ]] && continue
+  index="$cache/Packages.index"
+  curl -fLsS --limit-rate 2M "$base/dists/$codename/main/binary-$arch/Packages.gz" | gzip -dc |
+    awk 'BEGIN { RS = ""; FS = "\n"; OFS = "\t" }
+      {
+        p = f = s = d = v = ""
+        for (i = 1; i <= NF; i++) {
+          if ($i ~ /^Package: /) p = substr($i, 10)
+          else if ($i ~ /^Filename: /) f = substr($i, 11)
+          else if ($i ~ /^SHA256: /) s = substr($i, 9)
+          else if ($i ~ /^(Pre-)?Depends: /) { x = $i; sub(/^[^:]*: /, "", x); d = d == "" ? x : d ", " x }
+          else if ($i ~ /^Provides: /) v = substr($i, 11)
+        }
+        if (p != "" && f != "" && s != "") print p, f, s, d, v
+      }' >"$index" || return 1
+  while ((${#queue[@]})); do
+    pkg="${queue[0]}"
+    queue=("${queue[@]:1}")
+    [[ "$seen" != *" $pkg "* ]] || continue
+    seen+="$pkg "
+    line="$(awk -F'\t' -v p="$pkg" '$1 == p { print; exit }' "$index")"
+    [[ -n "$line" ]] || { warn "软件源中找不到依赖包: $pkg" >&2; return 1; }
+    IFS=$'\t' read -r _ filename checksum deps _ <<<"$line"
     target="$cache/${filename##*/}"
     curl -fLsS --limit-rate 1M "$base/$filename" -o "$target" || return 1
     printf '%s  %s\n' "$checksum" "$target" | sha256sum -c - >/dev/null 2>&1 || return 1
     sync
-  done < <(awk 'BEGIN { RS=""; FS="\n"; OFS="\t" }
-    {
-      package=filename=checksum=""
-      for (i=1; i<=NF; i++) {
-        if ($i ~ /^Package: /) package=substr($i, 10)
-        else if ($i ~ /^Filename: /) filename=substr($i, 11)
-        else if ($i ~ /^SHA256: /) checksum=substr($i, 9)
-      }
-      if (package && filename && checksum) print package, filename, checksum
-    }
-  ' "$index")
+    IFS=',' read -ra groups <<<"$deps"
+    for group in "${groups[@]}"; do
+      resolved=""
+      candidates=()
+      IFS='|' read -ra alts <<<"$group"
+      for alt in "${alts[@]}"; do
+        read -r name op want <<<"${alt//[()]/ }"
+        name="${name%%:*}"
+        [[ -n "$name" ]] || continue
+        if debian_dep_satisfied "$name" "$op" "$want"; then resolved=1; break; fi
+        while IFS= read -r cand; do
+          [[ -n "$cand" ]] || continue
+          [[ "$cand" == "$name" ]] || ! debian_dep_satisfied "$cand" || { resolved=1; break 2; }
+          candidates+=("$cand")
+        done < <(debian_dep_candidates "$index" "$name")
+      done
+      [[ -z "$resolved" ]] || continue
+      ((${#candidates[@]})) || { warn "无法解析依赖: $group" >&2; return 1; }
+      queue+=("${candidates[0]}")
+    done
+  done
   rm -f "$index"
 }
 
@@ -3072,7 +3147,13 @@ install_apt_lite_dependencies() {
   local debs=()
   mkdir -p "$ROOT"
   audit="$(dpkg --audit 2>/dev/null || true)"
-  [[ -z "$audit" ]] || {
+  if [[ -n "$audit" ]]; then
+    dpkg --configure -a >/dev/null 2>&1 || true
+    audit="$(dpkg --audit 2>/dev/null || true)"
+  fi
+  # On Debian the resolver below refetches unconfigured packages together with
+  # whatever they lack, which is how an interrupted earlier install is repaired.
+  [[ -z "$audit" || "$(system_id)" == debian ]] || {
     fail "dpkg 存在未完成事务，请先执行 dpkg --configure -a。"
     return 1
   }
@@ -3152,6 +3233,10 @@ install_dependencies() {
   fi
   if has_cmd apt-get; then
     mapfile -t packages < <(standard_missing_apt_packages)
+    if dpkg_python_broken; then
+      dpkg --configure -a || true
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -f || true
+    fi
     if ! apt-get update; then
       warn "APT 索引更新失败，将使用已成功更新或现有的可信索引继续安装，不会降低签名验证。"
     fi
@@ -3449,6 +3534,17 @@ except (ValueError, TypeError, AttributeError):
   return 0
 }
 
+alpine_upstream_core() {
+  local dir="$1" arch redirect version
+  arch="$(arch_name)" || return 1
+  redirect="$(curl -fsSLI -o /dev/null -w '%{url_effective}' --max-time 15     https://github.com/SagerNet/sing-box/releases/latest)" || return 1
+  version="${redirect##*/tag/v}"
+  [[ "$version" != "$redirect" && "$version" =~ ^[0-9][0-9A-Za-z.-]*$ ]] || return 1
+  curl -fLsS --limit-rate 1M     "https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-$arch-musl.tar.gz" |
+    tar -xzf - -C "$dir" || return 1
+  mv -f "$dir/sing-box-$version-linux-$arch-musl/sing-box" "$dir/sing-box"
+}
+
 download_core() {
   local mode="${1:-standard}" arch url tmp file lib stale
   if is_alpine; then
@@ -3481,17 +3577,23 @@ download_core() {
           for (i=1; i<=NF; i++) if ($i ~ /^V:/) { print substr($i, 3); found=1; break }
         }
       ')"
-    [[ -n "$version" ]] || {
-      rm -rf -- "$tmp"
-      fail "Alpine community 仓库中未找到 sing-box。"
-      return 1
-    }
-    url="$repository/$arch/sing-box-$version.apk"
-    info "正在以最低内存方式安装 Alpine sing-box $version..."
-    if ! curl -fLsS --limit-rate 1M "$url" -o "$tmp/sing-box.apk"; then
-      rm -rf -- "$tmp"
-      fail "Alpine sing-box 包下载失败。"
-      return 1
+    if [[ -z "$version" ]]; then
+      # Alpine packages sing-box only from 3.23 on; older releases take the
+      # upstream musl build over HTTPS, as the Debian path does.
+      info "Alpine community 仓库中没有 sing-box，改用官方 musl 构建..."
+      alpine_upstream_core "$tmp" || {
+        rm -rf -- "$tmp"
+        fail "sing-box 官方 musl 内核下载或解压失败。"
+        return 1
+      }
+      file="$tmp/sing-box"
+    else
+      url="$repository/$arch/sing-box-$version.apk"
+      info "正在以最低内存方式安装 Alpine sing-box $version..."
+      if ! curl -fLsS --limit-rate 1M "$url" -o "$tmp/sing-box.apk"; then
+        rm -rf -- "$tmp"
+        fail "Alpine sing-box 包下载失败。"
+        return 1
     fi
     sync
     if ! apk verify "$tmp/sing-box.apk" >/dev/null 2>&1; then
@@ -3515,6 +3617,7 @@ download_core() {
     wait "$sync_pid" 2>/dev/null || true
     file="$tmp/usr/bin/sing-box"
     rm -f "$tmp/sing-box.apk"
+    fi
     sync
     chmod 0755 "$file" || {
       rm -rf -- "$tmp"
@@ -3686,6 +3789,7 @@ add_hysteria2() {
   sni="$(pick_sni "$(random_sni)")" || return 1
   hopping="$(ask_hopping "Hysteria-2")" || return 1
   IFS=$'\t' read -r hop_start hop_end <<<"$hopping"
+  [[ -z "$hop_start" ]] || ensure_hopping_tools || return 1
   apply_state_change config set_selected_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end" || return 1
 }
 
@@ -4185,7 +4289,7 @@ change_protocol_config() {
         1) change_protocol_port "$proto" "$label" || return 1 ;;
         2) value="$(ask_text "Hysteria-2 密码" "$(proto_value hysteria2 password)")" || return 1; apply_state_change config set_protocol hysteria2 "password=$value" || return 1 ;;
         3) value="$(pick_sni "$(proto_value hysteria2 sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol hysteria2 "sni=$value" || return 1 ;;
-        4) hopping="$(ask_hopping "$label" "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")")" || return 1; IFS=$'\t' read -r hop_start hop_end <<<"$hopping"; apply_state_change config set_protocol hysteria2 "hop_start=$hop_start" "hop_end=$hop_end" || return 1 ;;
+        4) hopping="$(ask_hopping "$label" "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")")" || return 1; IFS=$'\t' read -r hop_start hop_end <<<"$hopping"; [[ -z "$hop_start" ]] || ensure_hopping_tools || return 1; apply_state_change config set_protocol hysteria2 "hop_start=$hop_start" "hop_end=$hop_end" || return 1 ;;
         5) change_protocol_ip_version hysteria2 "$label" || return 1 ;;
         0) return 1 ;;
       esac
