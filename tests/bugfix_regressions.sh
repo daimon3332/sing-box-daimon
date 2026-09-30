@@ -85,7 +85,7 @@ valid_script_file "$CASE_ROOT/good.sh"
 printf '#!/usr/bin/env bash\nSCRIPT_VERSION="1.0.0"\n' >"$SCRIPT"
 curl() { printf 'curl-called\n' >"$CASE_ROOT/curl-called"; return 1; }
 (
-  set -- ; BASH_ARGV0="$SCRIPT"
+  SCRIPT_SOURCE="$SCRIPT"
   write_managed_script
 )
 [[ ! -e "$CASE_ROOT/curl-called" ]]
@@ -137,10 +137,11 @@ grep -Fq "ExecStartPre=-/bin/bash $SCRIPT --apply-hopping" "$SERVICE"
 (
   require_core_installed() { return 0; }
   maybe_set_node_prefix() { :; }
+  protocol_menu_items() { AVAILABLE_PROTOCOLS=(mixed); }
   ask_menu() { printf '1'; }
   add_mixed() { return 1; }
   restart_if_running() { printf 'restarted\n' >"$CASE_ROOT/restarted"; }
-  out="$(add_protocol_menu 2>&1)"
+  out="$(add_protocol_menu 2>&1)" && exit 1
   [[ "$out" == *"协议添加失败"* && "$out" != *"协议已添加"* ]]
 )
 [[ ! -e "$CASE_ROOT/restarted" ]]

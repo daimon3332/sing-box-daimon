@@ -87,6 +87,7 @@ public_ipv6() { return 1; }
 require_core_installed() { :; }
 reality_keypair() { printf 'private-key\npublic-key\n'; }
 rebuild_configs() { :; }
+apply_protocol_firewall() { :; }
 show_protocol_details() { :; }
 PUBLIC_IPS_DETECTED=false
 PUBLIC_IPS_CHECKED=0
