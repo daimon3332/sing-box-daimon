@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 set -Eeuo pipefail
+umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.10.0"
+SCRIPT_VERSION="1.11.0"
+SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -22,6 +24,7 @@ NGINX_SUB_NAME="sing-box-daimon-sub"
 NGINX_SUB_CONF="/etc/nginx/sites-available/$NGINX_SUB_NAME"
 NGINX_SUB_LINK="/etc/nginx/sites-enabled/$NGINX_SUB_NAME"
 SNI_OPTIONS=("www.bing.com" "www.amazon.com" "www.apple.com")
+PROTOCOLS=(mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http)
 
 system_id() {
   local id=""
@@ -129,6 +132,17 @@ PY
 }
 
 url_encode() {
+  if is_alpine; then
+    local LC_ALL=C value="$1" char i
+    for ((i=0; i<${#value}; i++)); do
+      char="${value:i:1}"
+      case "$char" in
+        [a-zA-Z0-9.~_-]) printf '%s' "$char" ;;
+        *) printf '%%%02X' "'$char" ;;
+      esac
+    done
+    return 0
+  fi
   python3 - "$1" <<'PY'
 import sys, urllib.parse
 print(urllib.parse.quote(sys.argv[1], safe=""), end="")
@@ -145,32 +159,40 @@ b64_url() {
 
 ask_text() {
   local prompt="$1" default="${2:-}" value
-  # EOF leaves value empty, so the default applies. Swallowing the read failure
-  # keeps set -e from killing the script at an unanswerable prompt.
-  safe_read "$prompt [$default]: " value || true
+  safe_read "$prompt [$default]: " value || return 1
   printf '%s' "${value:-$default}"
 }
 
 ask_yes_no() {
   local prompt="$1" default="${2:-n}" value
   if [[ "$default" =~ ^[Yy]$ ]]; then
-    safe_read "$prompt [Y/n]: " value || true
+    safe_read "$prompt [Y/n]: " value || return 2
     value="${value:-y}"
   else
-    safe_read "$prompt [y/N]: " value || true
+    safe_read "$prompt [y/N]: " value || return 2
     value="${value:-n}"
   fi
   [[ "$value" =~ ^[Yy]$ ]]
 }
 
+menu_number() {
+  local value="$1" max="$2"
+  [[ "$value" =~ ^[0-9]+$ ]] || return 1
+  value="${value#"${value%%[!0]*}"}"
+  value="${value:-0}"
+  ((${#value} <= ${#max})) && ((10#$value <= max)) || return 1
+  printf '%s' "$value"
+}
+
 valid_port() {
-  [[ "$1" =~ ^[0-9]+$ ]] && (( "$1" >= 1 && "$1" <= 65535 ))
+  local port
+  port="$(menu_number "$1" 65535)" && ((port > 0))
 }
 
 valid_port_range() {
   [[ "$1" =~ ^([0-9]+)[:-]([0-9]+)$ ]] || return 1
   local start="${BASH_REMATCH[1]}" end="${BASH_REMATCH[2]}"
-  valid_port "$start" && valid_port "$end" && (( start <= end ))
+  valid_port "$start" && valid_port "$end" && ((10#$start <= 10#$end))
 }
 
 valid_domain() {
@@ -186,14 +208,21 @@ valid_ip_address() {
   if is_alpine || ! has_cmd python3; then
     if [[ "$version" == "4" ]]; then
       local a b c d extra
+      [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
       IFS=. read -r a b c d extra <<<"$address"
       [[ -z "${extra:-}" ]] || return 1
       for a in "$a" "$b" "$c" "$d"; do
-        [[ "$a" =~ ^[0-9]+$ ]] && ((10#$a <= 255)) || return 1
+        [[ "$a" =~ ^(0|[1-9][0-9]{0,2})$ ]] && ((10#$a <= 255)) || return 1
       done
       return 0
     fi
+    if [[ "$address" == *.* ]]; then
+      valid_ip_address "${address##*:}" 4 || return 1
+      address="${address%:*}:0:0"
+    fi
     [[ "$address" == *:* && "$address" =~ ^[0-9A-Fa-f:]+$ && "$address" != *:::* ]] || return 1
+    [[ "$address" != :* || "$address" == ::* ]] || return 1
+    [[ "$address" != *: || "$address" == *:: ]] || return 1
     local rest="$address" part count=0 compressed=false
     local -a parts=()
     if [[ "$address" == *::* ]]; then
@@ -228,8 +257,14 @@ PY
 
 endpoint_host_value() {
   local host="$1"
-  host="${host#[}"
-  host="${host%]}"
+  if [[ "$host" == "["* || "$host" == *"]" ]]; then
+    [[ "$host" == "["*"]" ]] || return 1
+    host="${host:1:${#host}-2}"
+    valid_ip_address "$host" 6 || return 1
+  fi
+  if [[ "$host" =~ ^[0-9.]+$ ]]; then
+    valid_ip_address "$host" 4 || return 1
+  fi
   if valid_ip_address "$host" 4 || valid_ip_address "$host" 6 || valid_domain "$host"; then
     printf '%s' "$host"
     return 0
@@ -242,7 +277,7 @@ ensure_dirs() {
 }
 
 ensure_state() {
-  ensure_dirs
+  ensure_dirs || return 1
   if is_alpine; then
     has_cmd jq || { fail "Alpine NAT 状态管理需要 jq。"; return 1; }
     if [[ ! -s "$STATE" ]]; then
@@ -251,14 +286,18 @@ ensure_state() {
     local token tmp
     token="$(jq -r '.token // ""' "$STATE" 2>/dev/null || true)"
     if ! valid_token "$token"; then
-      tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+      tmp="$(mktemp "$ROOT/.state.XXXXXX")" || return 1
       jq --arg token "$(rand_hex 16)" '.token = $token' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
       invalidate_state_cache
     fi
+    jq -e 'type == "object" and (.protocols | type == "object")' "$STATE" >/dev/null 2>&1 || {
+      fail "状态文件损坏，已停止操作：$STATE" >&2
+      return 1
+    }
     return 0
   fi
   if [[ ! -s "$STATE" ]]; then
-    python3 - "$STATE" <<'PY'
+    python3 - "$STATE" <<'PY' || return 1
 import json, os, secrets, sys
 state = {
   "token": secrets.token_hex(16),
@@ -289,6 +328,8 @@ PY
 import json, os, re, secrets, sys
 path = sys.argv[1]
 data = json.load(open(path, encoding="utf-8"))
+if not isinstance(data, dict) or not isinstance(data.get("protocols"), dict):
+  raise SystemExit(1)
 if re.fullmatch(r"[A-Za-z0-9]+", str(data.get("token", ""))):
   raise SystemExit(0)
 data["token"] = secrets.token_hex(16)
@@ -304,8 +345,11 @@ PY
   # A rotated token must drop the cached copy, otherwise callers keep the old
   # token and generate_subscription writes files under a name that no longer
   # matches state.json.
-  (( rc == 10 )) && invalidate_state_cache
-  return 0
+  case "$rc" in
+    0) return 0 ;;
+    10) invalidate_state_cache ;;
+    *) fail "状态文件读取失败，已停止操作：$STATE" >&2; return 1 ;;
+  esac
 }
 
 has_protocols() {
@@ -418,7 +462,7 @@ state_value() {
   [[ -s "$STATE" ]] || { printf '%s' "$default"; return 0; }
   if is_alpine; then
     jq -r --arg key "$key" --arg default "$default" '
-      try (getpath($key | split(".")) // $default) catch $default |
+      try (getpath($key | split(".")) | if . == null then $default else . end) catch $default |
       if type == "boolean" then tostring else tostring end
     ' "$STATE" 2>/dev/null || printf '%s' "$default"
     return 0
@@ -515,7 +559,7 @@ maybe_set_node_prefix() {
 }
 
 node_prefix_menu() {
-  ensure_state
+  ensure_state || return 1
   title "节点名称前缀"
   local current choice value
   current="$(node_prefix)"
@@ -528,9 +572,7 @@ node_prefix_menu() {
         safe_read "请输入节点名称前缀: " value || return 1
         value="${value#"${value%%[![:space:]]*}"}"
         value="${value%"${value##*[![:space:]]}"}"
-        if set_node_prefix "$value"; then
-          rebuild_configs || return 1
-          restart_if_running
+        if apply_state_change subscription set_node_prefix "$value"; then
           info "节点名称前缀已保存，订阅已更新。"
           return 0
         fi
@@ -538,9 +580,7 @@ node_prefix_menu() {
       done
       ;;
     2)
-      clear_node_prefix
-      rebuild_configs || return 1
-      restart_if_running
+      apply_state_change subscription clear_node_prefix || return 1
       info "节点名称前缀已删除，订阅已更新。"
       ;;
     0) return 1 ;;
@@ -557,12 +597,12 @@ lite_mode() {
 
 set_state_value() {
   local key="$1" value="$2"
-  ensure_state
+  ensure_state || return 1
   if is_alpine; then
     local tmp type=string
     [[ "$key" == "sub_port" || "$key" == "version.checked" ]] && [[ "$value" =~ ^[0-9]+$ ]] && type=number
-    [[ "$value" == "true" || "$value" == "false" ]] && type=boolean
-    tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+    [[ "$key" == "sub_tls" && ( "$value" == "true" || "$value" == "false" ) ]] && type=boolean
+    tmp="$(mktemp "$ROOT/.state.XXXXXX")" || return 1
     jq --arg key "$key" --arg value "$value" --arg type "$type" '
       ($key | split(".")) as $path |
       ($value | if $type == "number" then tonumber elif $type == "boolean" then . == "true" else . end) as $typed |
@@ -571,7 +611,7 @@ set_state_value() {
     invalidate_state_cache
     return
   fi
-  python3 - "$STATE" "$key" "$value" <<'PY'
+  python3 - "$STATE" "$key" "$value" <<'PY' || return 1
 import json, os, sys
 path, key, value = sys.argv[1], sys.argv[2].split("."), sys.argv[3]
 data = json.load(open(path, encoding="utf-8"))
@@ -580,7 +620,7 @@ for part in key[:-1]:
   cur = cur.setdefault(part, {})
 if key[-1] in {"sub_port"} and value.isdigit():
   cur[key[-1]] = int(value)
-elif value in {"true", "false"}:
+elif key[-1] == "sub_tls" and value in {"true", "false"}:
   cur[key[-1]] = value == "true"
 else:
   cur[key[-1]] = value
@@ -602,35 +642,13 @@ fetch_latest_script() {
 }
 
 refresh_version_cache() {
-  local latest now
+  local latest now tmp
   latest="$(fetch_latest_script | sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' | head -n1 || true)"
+  [[ "$latest" =~ ^[0-9]+[.][0-9]+[.][0-9]+$ ]] || return 1
   now="$(date +%s)"
-  ensure_state
-  if is_alpine; then
-    [[ -z "$latest" ]] || set_state_value version.latest "$latest"
-    set_state_value version.checked "$now"
-    return
-  fi
-  python3 - "$STATE" "$latest" "$now" <<'PY' >/dev/null 2>&1 || true
-import json, os, sys
-path, latest, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
-try:
-  data = json.load(open(path, encoding="utf-8"))
-except Exception:
-  raise SystemExit
-version = data.setdefault("version", {})
-if latest:
-  version["latest"] = latest
-version["checked"] = now
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-  json.dump(data, f, indent=2, ensure_ascii=False)
-  f.write("\n")
-  f.flush()
-  os.fsync(f.fileno())
-os.replace(tmp, path)
-PY
-  invalidate_state_cache
+  mkdir -p "$ROOT" || return 1
+  tmp="$(mktemp "$ROOT/.version.XXXXXX")" || return 1
+  printf '%s\t%s\n' "$latest" "$now" >"$tmp" && mv -f "$tmp" "$ROOT/.version-cache" || { rm -f "$tmp"; return 1; }
 }
 
 refresh_version_cache_async() {
@@ -645,6 +663,9 @@ version_status() {
   local latest checked now age status
   latest="$(state_value version.latest "")"
   checked="$(state_value version.checked 0)"
+  if [[ -r "$ROOT/.version-cache" ]]; then
+    IFS=$'\t' read -r latest checked <"$ROOT/.version-cache" || true
+  fi
   now="$(date +%s)"
   [[ "$checked" =~ ^[0-9]+$ ]] || checked=0
   age=$((now - checked))
@@ -664,23 +685,23 @@ version_status() {
 set_protocol() {
   local proto="$1"
   shift
-  ensure_state
+  ensure_state || return 1
   if is_alpine; then
     local tmp
-    tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+    tmp="$(mktemp "$ROOT/.state.XXXXXX")" || return 1
     jq --arg proto "$proto" --args '
       .protocols[$proto].enabled = true |
       reduce $ARGS.positional[] as $pair (.;
         ($pair | index("=")) as $split |
         ($pair[0:$split]) as $key |
         ($pair[$split + 1:]) as $raw |
-        ($raw | if ($key | test("port$") or $key == "alter_id") then tonumber elif . == "true" then true elif . == "false" then false else . end) as $value |
+        ($raw | if ($key | test("port$") or $key == "alter_id") then tonumber elif ($key == "enabled" or $key == "tls") then . == "true" else . end) as $value |
         .protocols[$proto][$key] = $value
       )
     ' "$@" <"$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
     return
   fi
-  python3 - "$STATE" "$proto" "$@" <<'PY'
+  python3 - "$STATE" "$proto" "$@" <<'PY' || return 1
 import json, os, sys
 path, proto, pairs = sys.argv[1], sys.argv[2], sys.argv[3:]
 data = json.load(open(path, encoding="utf-8"))
@@ -690,7 +711,7 @@ for pair in pairs:
   key, value = pair.split("=", 1)
   if key.endswith("port") or key in {"alter_id"}:
     item[key] = int(value)
-  elif value in {"true", "false"}:
+  elif key in {"enabled", "tls"} and value in {"true", "false"}:
     item[key] = value == "true"
   else:
     item[key] = value
@@ -710,11 +731,11 @@ delete_protocol_state() {
   [[ -s "$STATE" ]] || return 0
   if is_alpine; then
     local tmp
-    tmp="$(mktemp "$ROOT/.state.XXXXXX")"
+    tmp="$(mktemp "$ROOT/.state.XXXXXX")" || return 1
     jq --arg proto "$proto" 'del(.protocols[$proto])' "$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
     return
   fi
-  python3 - "$STATE" "$proto" <<'PY'
+  python3 - "$STATE" "$proto" <<'PY' || return 1
 import json, os, sys
 path, proto = sys.argv[1], sys.argv[2]
 data = json.load(open(path, encoding="utf-8"))
@@ -771,7 +792,7 @@ ufw_active() {
 ufw_allow_rule() {
   local rule="$1"
   [[ -n "$rule" ]] || return 0
-  ufw allow "$rule" >/dev/null 2>&1 || warn "防火墙放行失败: $rule"
+  ufw allow "$rule" >/dev/null 2>&1 || { warn "防火墙放行失败: $rule"; return 1; }
 }
 
 ufw_delete_rule() {
@@ -896,14 +917,14 @@ ufw_status_text() {
 sync_ufw_ports() {
   local desired=() managed=() rule
   ufw_active || return 0
-  ensure_dirs
+  ensure_dirs || return 1
   mapfile -t desired < <(required_ufw_rules | awk 'NF && !seen[$0]++')
   mapfile -t managed < <(managed_ufw_rules)
   for rule in "${managed[@]}"; do
     rule_in_list "$rule" "${desired[@]}" || ufw_delete_rule "$rule"
   done
   for rule in "${desired[@]}"; do
-    ufw_allow_rule "$rule"
+    ufw_allow_rule "$rule" || return 1
   done
   if ((${#desired[@]} > 0)); then
     printf '%s\n' "${desired[@]}" >"$UFW_RULES"
@@ -920,7 +941,7 @@ prepare_https_ufw_for_acme() {
   ufw_active || return 0
   for rule in 80/tcp 443/tcp; do
     if ! ufw_rule_open "$rule"; then
-      ufw_allow_rule "$rule"
+      ufw_allow_rule "$rule" || return 1
       HTTPS_UFW_BOOTSTRAP+=("$rule")
     fi
   done
@@ -981,20 +1002,21 @@ hopping_range_conflicts() {
 ask_hopping() {
   local proto="$1" current_start="${2:-}" current_end="${3:-}" range start end default_yn=n conflicts
   [[ -n "$current_start" && -n "$current_end" ]] && default_yn=y
-  # Both emissions must end in a newline. Without it `read` hits EOF and returns
-  # 1, which under set -e aborted the caller: adding Hysteria-2 individually and
-  # changing its hop range both died right after this prompt, leaving the
-  # protocol unwritten.
-  ask_yes_no "是否开启 ${proto} 跳跃端口？" "$default_yn" || { printf '\t\n'; return 0; }
+  local answer=0
+  ask_yes_no "是否开启 ${proto} 跳跃端口？" "$default_yn" || answer=$?
+  case "$answer" in
+    0) ;;
+    1) printf '\t\n'; return 0 ;;
+    *) return 1 ;;
+  esac
   while true; do
-    # EOF here means no range can be collected; emit the same empty pair as
-    # declining so the caller writes the protocol without hopping.
-    safe_read "请输入跳跃端口范围，格式 48000:50000${current_start:+ [$current_start:$current_end]}: " range || { printf '\t\n'; return 0; }
+    safe_read "请输入跳跃端口范围，格式 48000:50000${current_start:+ [$current_start:$current_end]}（0 返回）: " range || return 1
+    [[ "$range" != 0 ]] || return 1
     range="${range:-${current_start:+$current_start:$current_end}}"
     if valid_port_range "$range"; then
       range="${range/-/:}"
-      start="${range%%:*}"
-      end="${range##*:}"
+      start="$(menu_number "${range%%:*}" 65535)"
+      end="$(menu_number "${range##*:}" 65535)"
       conflicts="$(hopping_range_conflicts "$proto" "$start" "$end")"
       if [[ -n "$conflicts" ]]; then
         warn "该范围包含其他协议的 UDP 端口，会导致这些节点收不到流量: ${conflicts% }" >&2
@@ -1080,8 +1102,10 @@ port_used() {
 
 next_free_port() {
   local port="$1" exclude="${2:-}"
+  port="$(menu_number "$port" 65535)" || return 1
   while port_used "$port" "$exclude"; do
     port=$((port + 1))
+    ((port <= 65535)) || { warn "没有可用端口，请选择其他端口范围。" >&2; return 1; }
   done
   printf '%s' "$port"
 }
@@ -1104,18 +1128,17 @@ random_free_port() {
 
 ask_port() {
   local name="$1" default="$2" exclude="${3:-}" port input
-  port="$(next_free_port "$default" "$exclude")"
+  port="$(next_free_port "$default" "$exclude")" || return 1
   while true; do
-    # stdout is the return channel, so fall back to the pre-checked free port on
-    # EOF instead of aborting or looping on a closed stdin.
-    safe_read "$name 端口 [$port]: " input || { printf '%s' "$port"; return; }
+    safe_read "$name 端口 [$port]，输入 0 取消: " input || return 1
     input="${input:-$port}"
+    [[ "$input" == 0 ]] && return 1
     if ! valid_port "$input"; then
       warn "端口范围必须是 1-65535。" >&2
-    elif port_used "$input" "$exclude"; then
+    elif port_used "$(menu_number "$input" 65535)" "$exclude"; then
       warn "端口 $input 已占用，请重新输入。" >&2
     else
-      printf '%s' "$input"
+      menu_number "$input" 65535
       return
     fi
   done
@@ -1125,6 +1148,47 @@ protocol_exists() {
   [[ "$(proto_value "$1" enabled false)" == "true" ]]
 }
 
+protocol_menu_items() {
+  local mode="${1:-existing}" proto enabled
+  AVAILABLE_PROTOCOLS=()
+  for proto in "${PROTOCOLS[@]}"; do
+    enabled=false
+    protocol_exists "$proto" && enabled=true
+    if [[ "$mode" == missing ]]; then
+      [[ "$enabled" == false ]] || continue
+      if is_alpine || lite_mode; then
+        [[ "$proto" == vless_reality ]] || continue
+      fi
+    else
+      [[ "$enabled" == true ]] || continue
+    fi
+    AVAILABLE_PROTOCOLS+=("$proto")
+    printf '%s. %s' "${#AVAILABLE_PROTOCOLS[@]}" "$(node_base_name "$proto")"
+    [[ "$mode" == missing ]] || printf '  端口:%s  地址:%s' "$(proto_value "$proto" port)" "$(proto_ip_label "$proto")"
+    printf '\n'
+  done
+}
+
+select_existing_protocol() {
+  local all="${1:-false}" choice max
+  SELECTED_PROTOCOL=""
+  protocol_menu_items
+  max=${#AVAILABLE_PROTOCOLS[@]}
+  ((max)) || { warn "尚未添加协议。"; return 1; }
+  if [[ "$all" == true ]]; then
+    max=$((max + 1))
+    printf '%s. 全部已添加协议\n' "$max"
+  fi
+  printf '0. 返回\n'
+  choice="$(ask_menu "请选择协议: " "$max")"
+  [[ "$choice" != 0 ]] || return 1
+  if [[ "$all" == true && "$choice" == "$max" ]]; then
+    SELECTED_PROTOCOL=all
+  else
+    SELECTED_PROTOCOL="${AVAILABLE_PROTOCOLS[choice-1]}"
+  fi
+}
+
 ask_menu() {
   local prompt="$1" max="$2" input
   while true; do
@@ -1132,7 +1196,10 @@ ask_menu() {
     # "exit" choice every caller has. Retrying instead spun forever, since a
     # closed stdin never yields a valid number.
     safe_read "$prompt" input || { printf '0'; return; }
-    [[ "$input" =~ ^[0-9]+$ ]] && (( input >= 0 && input <= max )) && { printf '%s' "$input"; return; }
+    if input="$(menu_number "$input" "$max")"; then
+      printf '%s' "$input"
+      return 0
+    fi
     # stdout is the return channel; a message here becomes the caller's value.
     warn "请输入 0-$max 的数字。" >&2
   done
@@ -1144,7 +1211,7 @@ menu_line() {
 
 pick_sni() {
   local current="${1:-}" choice custom
-  printf "1. %s\n2. %s\n3. %s\n4. 自定义\n" "${SNI_OPTIONS[@]}" >&2
+  printf "1. %s\n2. %s\n3. %s\n4. 自定义\n0. 返回\n" "${SNI_OPTIONS[@]}" >&2
   choice="$(ask_menu "请选择 SNI [1-4]: " 4)"
   case "$choice" in
     1) printf '%s' "${SNI_OPTIONS[0]}" ;;
@@ -1152,13 +1219,13 @@ pick_sni() {
     3) printf '%s' "${SNI_OPTIONS[2]}" ;;
     4)
       while true; do
-        safe_read "请输入 SNI [${current:-www.bing.com}]: " custom || true
+        safe_read "请输入 SNI [${current:-www.bing.com}]: " custom || return 1
         custom="${custom:-${current:-www.bing.com}}"
         valid_domain "$custom" && { printf '%s' "$custom"; return; }
         warn "SNI 请输入有效域名。" >&2
       done
       ;;
-    *) printf '%s' "${SNI_OPTIONS[0]}" ;;
+    *) return 1 ;;
   esac
 }
 
@@ -1183,7 +1250,7 @@ PY
 
 ensure_cert() {
   local names san primary ext name missing=0
-  ensure_dirs
+  ensure_dirs || return 1
   mapfile -t names < <(cert_names | awk 'NF && !seen[$0]++')
   primary="${names[0]:-${SNI_OPTIONS[0]}}"
   san="$(printf '%s\n' "${names[@]}" | awk 'NF{printf "%sDNS:%s", sep, $0; sep=","}')"
@@ -1203,15 +1270,15 @@ ensure_cert() {
 }
 
 cert_pin_sha256() {
-  ensure_cert
+  ensure_cert || return 1
   openssl x509 -noout -fingerprint -sha256 -in "$CERT/self.crt" |
     awk -F= '{print tolower($2)}' |
     tr -d ':'
 }
 
 write_base_configs() {
-  ensure_dirs
-  cat >"$CONF/00_log.json" <<EOF
+  ensure_dirs || return 1
+  cat >"$CONF/00_log.json" <<EOF || return 1
 {
   "log": {
     "disabled": false,
@@ -1221,7 +1288,7 @@ write_base_configs() {
   }
 }
 EOF
-  cat >"$CONF/01_outbounds.json" <<'EOF'
+  cat >"$CONF/01_outbounds.json" <<'EOF' || return 1
 {
   "outbounds": [
     {
@@ -1235,7 +1302,7 @@ EOF
   ]
 }
 EOF
-  cat >"$CONF/03_route.json" <<'EOF'
+  cat >"$CONF/03_route.json" <<'EOF' || return 1
 {
   "route": {
     "rules": [],
@@ -1246,9 +1313,26 @@ EOF
 EOF
 }
 
+json_escape() {
+  if is_alpine; then
+    jq -nr --arg value "$1" '$value | tojson | .[1:-1]'
+  else
+    python3 -c 'import json,sys; print(json.dumps(sys.argv[1], ensure_ascii=False)[1:-1], end="")' "$1"
+  fi
+}
+
+escape_config_values() {
+  local name escaped
+  for name in "$@"; do
+    escaped="$(json_escape "${!name}")" || return 1
+    printf -v "$name" '%s' "$escaped"
+  done
+}
+
 write_mixed_config() {
   local port="$1" username="$2" password="$3"
-  cat >"$CONF/10_mixed.json" <<EOF
+  escape_config_values username password || return 1
+  cat >"$CONF/10_mixed.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1270,7 +1354,8 @@ EOF
 
 write_vless_config() {
   local port="$1" uuid="$2" sni="$3" private_key="$4" short_id="$5"
-  cat >"$CONF/11_vless_reality.json" <<EOF
+  escape_config_values uuid sni private_key short_id || return 1
+  cat >"$CONF/11_vless_reality.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1308,9 +1393,10 @@ EOF
 
 write_vmess_config() {
   local port="$1" uuid="$2" tls_enabled="$3"
+  escape_config_values uuid || return 1
   local tls_block=""
   if [[ "$tls_enabled" == "true" ]]; then
-    ensure_cert
+    ensure_cert || return 1
     tls_block=',
       "tls": {
         "enabled": true,
@@ -1318,7 +1404,7 @@ write_vmess_config() {
         "key_path": "'"$CERT"'/self.key"
       }'
   fi
-  cat >"$CONF/12_vmess_ws.json" <<EOF
+  cat >"$CONF/12_vmess_ws.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1345,8 +1431,9 @@ EOF
 
 write_hysteria2_config() {
   local port="$1" password="$2"
-  ensure_cert
-  cat >"$CONF/13_hysteria2.json" <<EOF
+  escape_config_values password || return 1
+  ensure_cert || return 1
+  cat >"$CONF/13_hysteria2.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1376,8 +1463,9 @@ EOF
 
 write_tuic_config() {
   local port="$1" uuid="$2" password="$3"
-  ensure_cert
-  cat >"$CONF/14_tuic.json" <<EOF
+  escape_config_values uuid password || return 1
+  ensure_cert || return 1
+  cat >"$CONF/14_tuic.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1410,8 +1498,9 @@ EOF
 
 write_anytls_config() {
   local port="$1" password="$2"
-  ensure_cert
-  cat >"$CONF/15_anytls.json" <<EOF
+  escape_config_values password || return 1
+  ensure_cert || return 1
+  cat >"$CONF/15_anytls.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1438,8 +1527,9 @@ EOF
 
 write_trojan_config() {
   local port="$1" password="$2"
-  ensure_cert
-  cat >"$CONF/16_trojan.json" <<EOF
+  escape_config_values password || return 1
+  ensure_cert || return 1
+  cat >"$CONF/16_trojan.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1466,7 +1556,8 @@ EOF
 
 write_shadowsocks_config() {
   local port="$1" password="$2" method="$3"
-  cat >"$CONF/17_shadowsocks.json" <<EOF
+  escape_config_values password method || return 1
+  cat >"$CONF/17_shadowsocks.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1484,7 +1575,8 @@ EOF
 
 write_vmess_tcp_config() {
   local port="$1" uuid="$2"
-  cat >"$CONF/18_vmess_tcp.json" <<EOF
+  escape_config_values uuid || return 1
+  cat >"$CONF/18_vmess_tcp.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1507,7 +1599,8 @@ EOF
 
 write_vmess_http_config() {
   local port="$1" uuid="$2" path="$3" host="$4"
-  cat >"$CONF/19_vmess_http.json" <<EOF
+  escape_config_values uuid path host || return 1
+  cat >"$CONF/19_vmess_http.json" <<EOF || return 1
 {
   "inbounds": [
     {
@@ -1535,50 +1628,136 @@ write_vmess_http_config() {
 EOF
 }
 
+apply_state_change() {
+  local rc=0
+  stage_state_change "$@" || rc=$?
+  invalidate_state_cache
+  return "$rc"
+}
+
+stage_state_change() (
+  local mode="$1" live_root="$ROOT" live_state="$STATE" live_conf="$CONF" live_sub="$SUB" live_cert="$CERT" stage file
+  shift
+  ensure_state || return 1
+  stage="$(mktemp -d "$ROOT/.change.XXXXXX")" || return 1
+  [[ "$stage" == "$ROOT"/.change.* && -d "$stage" ]] || return 1
+  trap 'rm -rf -- "$stage"' EXIT
+  local ROOT="$stage" STATE="$stage/state.json" CONF="$stage/conf" SUB="$stage/sub" CERT="$stage/cert"
+  local SB_STATE_CACHE_STAMP="" CHANGE_STAGED=true
+  local -A SB_STATE_CACHE=()
+  ensure_dirs || return 1
+  cp "$live_state" "$STATE" || return 1
+  [[ ! -d "$live_cert" ]] || cp -a "$live_cert/." "$CERT/" || return 1
+  "$@" || return 1
+  if [[ "$mode" == config ]]; then
+    [[ ! -d "$live_conf" ]] || cp -a "$live_conf/." "$CONF/" || return 1
+    render_configs || return 1
+    if [[ -x "$BIN" ]]; then
+      "$BIN" check -C "$CONF" || { fail "配置校验失败，原配置和节点参数未修改。" >&2; return 1; }
+    fi
+    for file in "$CONF"/*.json; do
+      [[ -f "$file" ]] || continue
+      if is_alpine; then
+        jq --arg old "$CERT/" --arg new "$live_cert/" 'walk(if type == "string" and startswith($old) then $new + ltrimstr($old) else . end)' "$file" >"$file.tmp" || return 1
+      else
+        python3 - "$file" "$CERT/" "$live_cert/" <<'PY' >"$file.tmp" || return 1
+import json, sys
+path, old, new = sys.argv[1:]
+def rewrite(value):
+    if isinstance(value, dict): return {k: rewrite(v) for k, v in value.items()}
+    if isinstance(value, list): return [rewrite(v) for v in value]
+    if isinstance(value, str) and value.startswith(old): return new + value[len(old):]
+    return value
+json.dump(rewrite(json.load(open(path, encoding="utf-8"))), sys.stdout, indent=2, ensure_ascii=False)
+PY
+      fi
+      mv -f "$file.tmp" "$file" || return 1
+    done
+  else
+    generate_subscription || return 1
+  fi
+  for file in "$CERT"/*; do
+    [[ -f "$file" ]] || continue
+    cmp -s "$file" "$live_cert/${file##*/}" || mv -f "$file" "$live_cert/${file##*/}" || return 1
+  done
+  if [[ "$mode" == config ]]; then
+    for file in "$live_conf"/{10..29}_*.json; do
+      [[ ! -f "$file" || -f "$CONF/${file##*/}" ]] || rm -f -- "$file" || return 1
+    done
+    for file in "$CONF"/*.json; do
+      [[ -f "$file" ]] || continue
+      mv -f "$file" "$live_conf/${file##*/}" || return 1
+    done
+  fi
+  for file in "$SUB"/*; do
+    [[ -f "$file" ]] || continue
+    mv -f "$file" "$live_sub/${file##*/}" || return 1
+  done
+  mv -f "$STATE" "$live_state" || return 1
+  ROOT="$live_root" STATE="$live_state" CONF="$live_conf" SUB="$live_sub" CERT="$live_cert"
+  invalidate_state_cache
+  if lite_mode; then
+    rm -f "$SUB/clash.yaml" "$SUB/v2rayn_raw.txt" "$SUB/v2rayn.txt" "$SUB/sub.txt"
+  else
+    prune_stale_token_files "$(state_value token)" || return 1
+  fi
+  if [[ "$mode" == config ]]; then
+    apply_protocol_firewall || return 1
+  fi
+)
+
 rebuild_configs() {
-  ensure_state
-  write_base_configs
+  apply_state_change config :
+}
+
+render_configs() {
+  ensure_state || return 1
+  write_base_configs || return 1
   rm -f "$CONF"/{10..29}_*.json
   if [[ "$(proto_value mixed enabled false)" == "true" ]]; then
-    write_mixed_config "$(proto_value mixed port)" "$(proto_value mixed username daimon)" "$(proto_value mixed password daimon)"
+    write_mixed_config "$(proto_value mixed port)" "$(proto_value mixed username daimon)" "$(proto_value mixed password daimon)" || return 1
   fi
   if [[ "$(proto_value vless_reality enabled false)" == "true" ]]; then
-    write_vless_config "$(proto_value vless_reality port)" "$(proto_value vless_reality uuid)" "$(proto_value vless_reality sni)" "$(proto_value vless_reality private_key)" "$(proto_value vless_reality short_id)"
+    write_vless_config "$(proto_value vless_reality port)" "$(proto_value vless_reality uuid)" "$(proto_value vless_reality sni)" "$(proto_value vless_reality private_key)" "$(proto_value vless_reality short_id)" || return 1
   fi
   if [[ "$(proto_value vmess_ws enabled false)" == "true" ]]; then
-    write_vmess_config "$(proto_value vmess_ws port)" "$(proto_value vmess_ws uuid)" "$(proto_value vmess_ws tls false)"
+    write_vmess_config "$(proto_value vmess_ws port)" "$(proto_value vmess_ws uuid)" "$(proto_value vmess_ws tls false)" || return 1
   fi
   if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
-    write_hysteria2_config "$(proto_value hysteria2 port)" "$(proto_value hysteria2 password)"
+    write_hysteria2_config "$(proto_value hysteria2 port)" "$(proto_value hysteria2 password)" || return 1
   fi
   if [[ "$(proto_value tuic enabled false)" == "true" ]]; then
-    write_tuic_config "$(proto_value tuic port)" "$(proto_value tuic uuid)" "$(proto_value tuic password)"
+    write_tuic_config "$(proto_value tuic port)" "$(proto_value tuic uuid)" "$(proto_value tuic password)" || return 1
   fi
   if [[ "$(proto_value anytls enabled false)" == "true" ]]; then
-    write_anytls_config "$(proto_value anytls port)" "$(proto_value anytls password)"
+    write_anytls_config "$(proto_value anytls port)" "$(proto_value anytls password)" || return 1
   fi
   if [[ "$(proto_value trojan enabled false)" == "true" ]]; then
-    write_trojan_config "$(proto_value trojan port)" "$(proto_value trojan password)"
+    write_trojan_config "$(proto_value trojan port)" "$(proto_value trojan password)" || return 1
   fi
   if [[ "$(proto_value shadowsocks enabled false)" == "true" ]]; then
-    write_shadowsocks_config "$(proto_value shadowsocks port)" "$(proto_value shadowsocks password)" "$(proto_value shadowsocks method aes-128-gcm)"
+    write_shadowsocks_config "$(proto_value shadowsocks port)" "$(proto_value shadowsocks password)" "$(proto_value shadowsocks method aes-128-gcm)" || return 1
   fi
   if [[ "$(proto_value vmess_tcp enabled false)" == "true" ]]; then
-    write_vmess_tcp_config "$(proto_value vmess_tcp port)" "$(proto_value vmess_tcp uuid)"
+    write_vmess_tcp_config "$(proto_value vmess_tcp port)" "$(proto_value vmess_tcp uuid)" || return 1
   fi
   if [[ "$(proto_value vmess_http enabled false)" == "true" ]]; then
-    write_vmess_http_config "$(proto_value vmess_http port)" "$(proto_value vmess_http uuid)" "$(proto_value vmess_http path /vmess-http)" "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")"
+    write_vmess_http_config "$(proto_value vmess_http port)" "$(proto_value vmess_http uuid)" "$(proto_value vmess_http path /vmess-http)" "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")" || return 1
   fi
+  generate_subscription
+}
+
+apply_protocol_firewall() {
   if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
     apply_hopping_rules hysteria2 "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")" "$(proto_value hysteria2 port)"
   else
     delete_hopping_rules hysteria2
   fi
   delete_hopping_rules tuic
-  sync_ufw_ports
+  sync_ufw_ports || { fail "配置已保存，但防火墙同步失败，请检查端口放行后重新应用。"; return 1; }
   save_firewall_rules
-  generate_subscription
 }
+
 
 public_ipv4() {
   local ip
@@ -1677,10 +1856,11 @@ choose_node_ip_version() {
   SELECTED_ENDPOINT_HOST=""
   detect_public_ips true && detected=true
   if [[ -n "$DETECTED_PUBLIC_IPV4" && -n "$DETECTED_PUBLIC_IPV6" ]]; then
-    printf "请选择 %s 客户端连接地址：\n1. 仅 IPv4  %s\n2. 仅 IPv6  %s\n3. IPv4 + IPv6\n4. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
+    printf "请选择 %s 客户端连接地址：\n1. 仅 IPv4  %s\n2. 仅 IPv6  %s\n3. IPv4 + IPv6\n4. 手动输入 IP 或域名\n0. 返回\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
     while true; do
       safe_read "请选择 [1-4]: " choice || return 1
       case "$choice" in
+        0) return 1 ;;
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
         2) SELECTED_IP_VERSION=ipv6; return 0 ;;
         3) SELECTED_IP_VERSION=dual; return 0 ;;
@@ -1689,20 +1869,22 @@ choose_node_ip_version() {
       esac
     done
   elif [[ -n "$DETECTED_PUBLIC_IPV4" ]]; then
-    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV4" >&2
+    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 手动输入 IP 或域名\n0. 返回\n" "$label" "$DETECTED_PUBLIC_IPV4" >&2
     while true; do
       safe_read "请选择 [1-2]: " choice || return 1
       case "$choice" in
+        0) return 1 ;;
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
         2) break ;;
         *) warn "请输入 1-2 的数字。" >&2 ;;
       esac
     done
   elif [[ -n "$DETECTED_PUBLIC_IPV6" ]]; then
-    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv6  %s\n2. 手动输入 IP 或域名\n" "$label" "$DETECTED_PUBLIC_IPV6" >&2
+    printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv6  %s\n2. 手动输入 IP 或域名\n0. 返回\n" "$label" "$DETECTED_PUBLIC_IPV6" >&2
     while true; do
       safe_read "请选择 [1-2]: " choice || return 1
       case "$choice" in
+        0) return 1 ;;
         1) SELECTED_IP_VERSION=ipv6; return 0 ;;
         2) break ;;
         *) warn "请输入 1-2 的数字。" >&2 ;;
@@ -1712,7 +1894,8 @@ choose_node_ip_version() {
     warn "未检测到可用的公网 IPv4 或 IPv6，请手动输入客户端连接地址。" >&2
   fi
   while true; do
-    safe_read "请输入客户端连接 IPv4、IPv6 或域名: " input || return 1
+    safe_read "请输入客户端连接 IPv4、IPv6 或域名（0 返回）: " input || return 1
+    [[ "$input" != 0 ]] || return 1
     if SELECTED_ENDPOINT_HOST="$(endpoint_host_value "$input")"; then
       SELECTED_IP_VERSION=custom
       return 0
@@ -1880,7 +2063,7 @@ protocol_link_rows_base() {
     sni="$(proto_value vless_reality sni)"
     public_key="$(proto_value vless_reality public_key)"
     short_id="$(proto_value vless_reality short_id)"
-    printf '%s\tvless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' "$(node_name vless_reality)" "$uuid" "$url_host" "$port" "$sni" "$public_key" "$short_id" "$(node_name vless_reality)"
+    printf '%s\tvless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' "$(node_name vless_reality)" "$uuid" "$url_host" "$port" "$sni" "$public_key" "$short_id" "$(url_encode "$(node_name vless_reality)")"
   fi
   if [[ "$(proto_value vmess_ws enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == vmess_ws ) ]]; then
     local port uuid tls vmess
@@ -1910,7 +2093,7 @@ PY
     hy_hop_start="$(proto_value hysteria2 hop_start "")"
     hy_hop_end="$(proto_value hysteria2 hop_end "")"
     [[ -n "$hy_hop_start" && -n "$hy_hop_end" ]] && hy_mport="&mport=$hy_hop_start-$hy_hop_end" || hy_mport=""
-    printf '%s\thysteria2://%s@%s:%s?security=tls&alpn=h3&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&hop_interval=30s%s#%s\n' "$(node_name hysteria2)" "$hy_password" "$url_host" "$hy_port" "$hy_sni" "$hy_mport" "$(node_name hysteria2)"
+    printf '%s\thysteria2://%s@%s:%s?security=tls&alpn=h3&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&hop_interval=30s%s#%s\n' "$(node_name hysteria2)" "$hy_password" "$url_host" "$hy_port" "$hy_sni" "$hy_mport" "$(url_encode "$(node_name hysteria2)")"
   fi
   if [[ "$(proto_value tuic enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == tuic ) ]]; then
     local tuic_auth tuic_sni
@@ -1923,7 +2106,7 @@ print(urllib.parse.quote(f"{sys.argv[1]}:{sys.argv[2]}", safe=":"), end="")
 PY
 )"
     tuic_sni="$(proto_value tuic sni "${SNI_OPTIONS[0]}")"
-    printf '%s\ttuic://%s@%s:%s?security=tls&sni=%s&alpn=h3&insecure=1&allowInsecure=1&allow_insecure=1&udp_relay_mode=native&congestion_control=bbr#%s\n' "$(node_name tuic)" "$tuic_auth" "$url_host" "$(proto_value tuic port)" "$tuic_sni" "$(node_name tuic)"
+    printf '%s\ttuic://%s@%s:%s?security=tls&sni=%s&alpn=h3&insecure=1&allowInsecure=1&allow_insecure=1&udp_relay_mode=native&congestion_control=bbr#%s\n' "$(node_name tuic)" "$tuic_auth" "$url_host" "$(proto_value tuic port)" "$tuic_sni" "$(url_encode "$(node_name tuic)")"
   fi
   if [[ "$(proto_value anytls enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == anytls ) ]]; then
     local any_sni any_port any_password
@@ -1933,7 +2116,7 @@ PY
     any_sni="$(proto_value anytls sni "${SNI_OPTIONS[0]}")"
     any_port="$(proto_value anytls port)"
     any_password="$(url_encode "$(proto_value anytls password)")"
-    printf '%s\tanytls://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&fp=chrome#%s\n' "$(node_name anytls)" "$any_password" "$url_host" "$any_port" "$any_sni" "$(node_name anytls)"
+    printf '%s\tanytls://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&fp=chrome#%s\n' "$(node_name anytls)" "$any_password" "$url_host" "$any_port" "$any_sni" "$(url_encode "$(node_name anytls)")"
   fi
   if [[ "$(proto_value trojan enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == trojan ) ]]; then
     local trojan_password trojan_sni
@@ -1942,7 +2125,7 @@ PY
     url_host="$PROTOCOL_URL_HOST"
     trojan_password="$(url_encode "$(proto_value trojan password)")"
     trojan_sni="$(proto_value trojan sni "${SNI_OPTIONS[0]}")"
-    printf '%s\ttrojan://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&type=tcp#%s\n' "$(node_name trojan)" "$trojan_password" "$url_host" "$(proto_value trojan port)" "$trojan_sni" "$(node_name trojan)"
+    printf '%s\ttrojan://%s@%s:%s?security=tls&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&type=tcp#%s\n' "$(node_name trojan)" "$trojan_password" "$url_host" "$(proto_value trojan port)" "$trojan_sni" "$(url_encode "$(node_name trojan)")"
   fi
   if [[ "$(proto_value shadowsocks enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == shadowsocks ) ]]; then
     local ss_userinfo
@@ -1954,7 +2137,7 @@ import base64, sys
 print(base64.urlsafe_b64encode(f"{sys.argv[1]}:{sys.argv[2]}".encode()).decode().rstrip("="), end="")
 PY
 )"
-    printf '%s\tss://%s@%s:%s#%s\n' "$(node_name shadowsocks)" "$ss_userinfo" "$url_host" "$(proto_value shadowsocks port)" "$(node_name shadowsocks)"
+    printf '%s\tss://%s@%s:%s#%s\n' "$(node_name shadowsocks)" "$ss_userinfo" "$url_host" "$(proto_value shadowsocks port)" "$(url_encode "$(node_name shadowsocks)")"
   fi
   if [[ "$(proto_value vmess_tcp enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == vmess_tcp ) ]]; then
     local vmess_tcp
@@ -1992,9 +2175,10 @@ PY
     user="$(url_encode "$(proto_value mixed username daimon)")"
     pass="$(url_encode "$(proto_value mixed password daimon)")"
     auth="${user}:${pass}"
-    printf '%s\tsocks5://%s@%s:%s#%s\n' "$(node_name mixed)" "$auth" "$url_host" "$(proto_value mixed port)" "$(node_name mixed)"
+    printf '%s\tsocks5://%s@%s:%s#%s\n' "$(node_name mixed)" "$auth" "$url_host" "$(proto_value mixed port)" "$(url_encode "$(node_name mixed)")"
   fi
 }
+
 
 protocol_link_rows() {
   local proto
@@ -2007,9 +2191,13 @@ protocol_link_rows() {
 }
 
 generate_subscription() {
-  ensure_state
-  ensure_dirs
-  load_state_cache || true
+  if [[ "${CHANGE_STAGED:-false}" != true ]]; then
+    apply_state_change subscription :
+    return $?
+  fi
+  ensure_state || return 1
+  ensure_dirs || return 1
+  is_alpine || load_state_cache || true
   local token raw v2rayn_raw sub_file ipv4 ipv6 pin prefix
   detect_public_ips || true
   if protocols_require_detected_host && [[ -z "$DETECTED_PUBLIC_IPV4" && -z "$DETECTED_PUBLIC_IPV6" ]]; then
@@ -2018,7 +2206,7 @@ generate_subscription() {
   fi
   validate_protocol_hosts || return 1
   if lite_mode; then
-    protocol_link_rows | cut -f2- >"$SUB/raw.txt"
+    protocol_link_rows | cut -f2- >"$SUB/raw.txt" || return 1
     rm -f "$SUB/clash.yaml" "$SUB/v2rayn_raw.txt" "$SUB/v2rayn.txt" "$SUB/sub.txt"
     return
   fi
@@ -2027,12 +2215,12 @@ generate_subscription() {
   ipv6="$DETECTED_PUBLIC_IPV6"
   pin=""
   prefix="$(node_prefix)"
-  protocols_require_certificate && pin="$(cert_pin_sha256)"
+  if protocols_require_certificate; then pin="$(cert_pin_sha256)" || return 1; fi
   raw="$SUB/raw.txt"
   v2rayn_raw="$SUB/v2rayn_raw.txt"
   sub_file="$SUB/sub.txt"
-  protocol_link_rows | cut -f2- >"$raw"
-  python3 - "$STATE" "$SUB/clash.yaml" "$v2rayn_raw" "$ipv4" "$ipv6" "$pin" "$CERT/self.crt" "$prefix" <<'PY'
+  protocol_link_rows | cut -f2- >"$raw" || return 1
+  python3 - "$STATE" "$SUB/clash.yaml" "$v2rayn_raw" "$ipv4" "$ipv6" "$pin" "$CERT/self.crt" "$prefix" <<'PY' || return 1
 import base64, json, sys, urllib.parse
 
 state_path, clash_path, v2rayn_path, ipv4, ipv6, pin, cert_path, prefix = sys.argv[1:9]
@@ -2350,12 +2538,12 @@ if enabled("mixed"):
     append_v2("mixed", "socks://{}@{}:{}#{}".format(credentials, uri_host(host_for("mixed")), val("mixed", "port"), u(node_name("Mixed-SOCKS5"))))
 open(v2rayn_path, "w", encoding="utf-8").write("\n".join(v2) + ("\n" if v2 else ""))
 PY
-  b64 <"$v2rayn_raw" >"$SUB/v2rayn.txt"
-  cp "$SUB/v2rayn.txt" "$sub_file"
-  cp "$sub_file" "$SUB/$token"
-  cp "$SUB/v2rayn.txt" "$SUB/$token.v2rayn"
-  cp "$SUB/clash.yaml" "$SUB/$token.clash"
-  cp "$raw" "$SUB/$token.raw"
+  b64 <"$v2rayn_raw" >"$SUB/v2rayn.txt" || return 1
+  cp "$SUB/v2rayn.txt" "$sub_file" || return 1
+  cp "$sub_file" "$SUB/$token" || return 1
+  cp "$SUB/v2rayn.txt" "$SUB/$token.v2rayn" || return 1
+  cp "$SUB/clash.yaml" "$SUB/$token.clash" || return 1
+  cp "$raw" "$SUB/$token.raw" || return 1
   prune_stale_token_files "$token"
 }
 
@@ -2401,8 +2589,8 @@ show_protocol_links() {
 }
 
 write_sub_server() {
-  ensure_state
-  cat >"$SUB_SERVER" <<EOF
+  ensure_state || return 1
+  cat >"$SUB_SERVER" <<EOF || return 1
 #!/usr/bin/env python3
 import http.server
 import json
@@ -2506,15 +2694,22 @@ EOF
 
 write_managed_script() {
   local src tmp
-  src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-  if [[ -r "$src" && "$src" != "$SCRIPT" ]] && head -n 3 "$src" 2>/dev/null | grep -q "bash"; then
-    install -m 0755 "$src" "$SCRIPT"
-  else
-    tmp="$ROOT/sb.sh.tmp"
-    curl -fsSL "$SCRIPT_URL" -o "$tmp"
-    install -m 0755 "$tmp" "$SCRIPT"
-    rm -f "$tmp"
+  src="$(readlink -f "$SCRIPT_SOURCE" 2>/dev/null || printf '%s' "$SCRIPT_SOURCE")"
+  if [[ "$src" == "$SCRIPT" && -s "$SCRIPT" ]]; then
+    chmod 0755 "$SCRIPT"
+    return $?
   fi
+  if [[ -r "$src" ]] && grep -q '^SCRIPT_VERSION=' "$src"; then
+    bash -n "$src" && install -m 0755 "$src" "$SCRIPT"
+    return $?
+  fi
+  tmp="$(mktemp "$ROOT/.script.XXXXXX")" || return 1
+  if ! fetch_latest_script >"$tmp" || ! bash -n "$tmp" || ! grep -q '^SCRIPT_VERSION=' "$tmp"; then
+    rm -f "$tmp"
+    fail "管理脚本下载或校验失败。"
+    return 1
+  fi
+  chmod 0755 "$tmp" && mv -f "$tmp" "$SCRIPT" || { rm -f "$tmp"; return 1; }
 }
 
 managed_service_exists() {
@@ -2522,7 +2717,7 @@ managed_service_exists() {
   if is_alpine; then
     [[ -x "/etc/init.d/$name" ]]
   else
-    systemctl list-unit-files "$name.service" >/dev/null 2>&1 || systemctl status "$name.service" >/dev/null 2>&1
+    [[ "$(systemctl show -p LoadState --value "$name.service" 2>/dev/null)" == loaded ]]
   fi
 }
 
@@ -2579,7 +2774,7 @@ write_services() {
   local mode="${1:-standard}"
   if is_alpine; then
     [[ "$mode" == "lite" ]] || { fail "Alpine 仅支持 NAT 轻量 VLESS Reality 安装。"; return 1; }
-    cat >"$SERVICE" <<EOF
+    cat >"$SERVICE" <<EOF || return 1
 #!/sbin/openrc-run
 name="sing-box"
 description="sing-box NAT lite service"
@@ -2601,7 +2796,7 @@ EOF
     rm -f "$SUB_SERVICE" "$SUB_SERVER"
     return
   fi
-  cat >"$SERVICE" <<EOF
+  cat >"$SERVICE" <<EOF || return 1
 [Unit]
 Description=sing-box service
 After=network-online.target nss-lookup.target
@@ -2617,7 +2812,7 @@ LimitNOFILE=1048576
 WantedBy=multi-user.target
 EOF
   if [[ "$mode" == "standard" ]]; then
-    cat >"$SUB_SERVICE" <<EOF
+    cat >"$SUB_SERVICE" <<EOF || return 1
 [Unit]
 Description=sing-box daimon subscription service
 After=network-online.target
@@ -2707,7 +2902,7 @@ install_alpine_lite_dependencies() {
   local required=(bash curl ca-certificates jq)
   local missing=()
   local installed=()
-  ensure_dirs
+  ensure_dirs || return 1
   for package in "${required[@]}"; do
     apk info -e "$package" >/dev/null 2>&1 || missing+=("$package")
   done
@@ -2799,8 +2994,7 @@ install_apt_lite_dependencies() {
   }
   mkdir -p "$cache/partial"
   info "正在以低内存方式下载 NAT 必需依赖..."
-  os_id=""
-  [[ ! -r /etc/os-release ]] || os_id="$(. /etc/os-release; printf '%s' "${ID:-}")"
+  os_id="$(system_id)"
   if [[ "$os_id" == "debian" ]]; then
     download_debian_lite_packages "$cache" || {
       rm -rf -- "$cache"
@@ -2998,7 +3192,7 @@ write_nginx_subscription_config() {
   local domain="$1" port="$2" dir
   dir="$(subscription_cert_dir "$domain")"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
-  cat >"$NGINX_SUB_CONF" <<EOF
+  cat >"$NGINX_SUB_CONF" <<EOF || return 1
 server {
     listen 80;
     server_name $domain;
@@ -3038,18 +3232,29 @@ EOF
   fi
 }
 
-remove_subscription_nginx_and_cert() {
-  local domain="${1:-}" acme dir
-  rm -f "$NGINX_SUB_CONF" "$NGINX_SUB_LINK"
-  if [[ -n "$domain" ]]; then
-    acme="$(acme_bin)"
-    [[ -x "$acme" ]] && "$acme" --remove -d "$domain" >/dev/null 2>&1 || true
-    dir="$(subscription_cert_dir "$domain")"
-    [[ -d "$dir" ]] && rm -rf "$dir"
+remove_subscription_cert() {
+  local domain="$1" acme dir
+  valid_domain "$domain" || return 1
+  acme="$(acme_bin)"
+  [[ ! -x "$acme" ]] || "$acme" --remove -d "$domain" >/dev/null 2>&1 || return 1
+  dir="$(subscription_cert_dir "$domain")"
+  if [[ -d "$dir" ]]; then
+    [[ "$(readlink -f "$dir")" == "/root/domain/$domain" ]] || return 1
+    rm -rf -- "$dir"
   fi
+}
+
+remove_subscription_nginx_and_cert() {
+  local domain="${1:-}"
+  rm -f "$NGINX_SUB_CONF" "$NGINX_SUB_LINK" || return 1
+  [[ -z "$domain" ]] || remove_subscription_cert "$domain" || return 1
   if has_cmd nginx; then
     nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
   fi
+}
+
+set_https_state() {
+  set_state_value sub_domain "$1" && set_state_value sub_tls "$2"
 }
 
 configure_https_subscription_domain() {
@@ -3058,34 +3263,28 @@ configure_https_subscription_domain() {
   port="$(state_value sub_port 2096)"
   email="admin@$domain"
   old_domain="$(state_value sub_domain "")"
-  if [[ -n "$old_domain" && "$old_domain" != "$domain" ]]; then
-    remove_subscription_nginx_and_cert "$old_domain"
-    set_state_value sub_domain ""
-    set_state_value sub_tls false
-  fi
-  install_nginx_acme_deps
+  install_nginx_acme_deps || return 1
   ensure_acme "$email" || return 1
-  prepare_https_ufw_for_acme
+  prepare_https_ufw_for_acme || return 1
   if ! issue_subscription_cert "$domain"; then
-    fail "证书申请失败，已停止配置 HTTPS 订阅。"
-    remove_subscription_nginx_and_cert "$domain"
+    fail "证书申请失败，原 HTTPS 订阅配置未修改。"
     rollback_https_ufw_for_acme
-    [[ -n "$old_domain" && "$old_domain" != "$domain" ]] || { set_state_value sub_domain ""; set_state_value sub_tls false; }
     return 1
   fi
-  if ! write_nginx_subscription_config "$domain" "$port"; then
-    fail "nginx 配置失败，已停止配置 HTTPS 订阅。"
-    remove_subscription_nginx_and_cert "$domain"
+  if ! write_nginx_subscription_config "$domain" "$port" ||
+     ! apply_state_change subscription set_https_state "$domain" true; then
+    fail "HTTPS 订阅配置失败，正在恢复原域名配置。"
+    if [[ -n "$old_domain" ]]; then
+      write_nginx_subscription_config "$old_domain" "$port" || warn "原 nginx 配置恢复失败，请检查日志。"
+    fi
     rollback_https_ufw_for_acme
-    [[ -n "$old_domain" && "$old_domain" != "$domain" ]] || { set_state_value sub_domain ""; set_state_value sub_tls false; }
     return 1
   fi
-  set_state_value sub_domain "$domain"
-  set_state_value sub_tls true
-  generate_subscription
-  sync_ufw_ports
+  if [[ -n "$old_domain" && "$old_domain" != "$domain" ]]; then
+    remove_subscription_cert "$old_domain" || warn "旧域名证书清理失败，新订阅已配置。"
+  fi
+  sync_ufw_ports || return 1
   HTTPS_UFW_BOOTSTRAP=()
-  restart_sub_service || true
   info "HTTPS 订阅域名已配置: https://$domain/sub/$(state_value token)"
 }
 
@@ -3093,12 +3292,9 @@ delete_https_subscription_domain() {
   local domain
   domain="$(state_value sub_domain "")"
   [[ -n "$domain" ]] || { warn "当前未设置 HTTPS 订阅域名。"; return 0; }
-  remove_subscription_nginx_and_cert "$domain"
-  set_state_value sub_domain ""
-  set_state_value sub_tls false
-  generate_subscription
-  sync_ufw_ports
-  restart_sub_service || true
+  remove_subscription_nginx_and_cert "$domain" || { fail "HTTPS 配置清理失败，请检查 nginx 和证书状态。"; return 1; }
+  apply_state_change subscription set_https_state "" false || { fail "HTTPS 配置已清理，但订阅状态更新失败，请重试。"; return 1; }
+  sync_ufw_ports || { fail "HTTPS 配置已删除，但防火墙同步失败。"; return 1; }
   info "HTTPS 订阅域名配置已删除，HTTP/IP 订阅仍保留。"
 }
 
@@ -3117,11 +3313,19 @@ arch_name() {
 core_download_url() {
   local arch="$1" url version redirect
   url="$(curl -fsSL --max-time 15 https://api.github.com/repos/SagerNet/sing-box/releases/latest 2>/dev/null |
-    grep browser_download_url |
-    grep "linux-$arch.tar.gz" |
-    grep -v '\.asc' |
-    head -n1 |
-    cut -d '"' -f4 || true)"
+    python3 -c '
+import json, sys
+try:
+    release = json.load(sys.stdin)
+    suffix = "-linux-" + sys.argv[1] + ".tar.gz"
+    for asset in release.get("assets", []):
+        url = asset.get("browser_download_url", "")
+        if url.startswith("https://") and url.endswith(suffix):
+            print(url)
+            break
+except (ValueError, TypeError, AttributeError):
+    pass
+' "$arch" || true)"
   if [[ -n "$url" ]]; then
     printf '%s' "$url"
     return 0
@@ -3294,7 +3498,7 @@ download_core() {
 }
 
 install_shortcuts() {
-  write_managed_script
+  write_managed_script || return 1
   ln -sf "$SCRIPT" /usr/local/bin/sb
   if [[ -e /usr/local/bin/sing-box && ! "$(readlink -f /usr/local/bin/sing-box 2>/dev/null || true)" == "$SCRIPT" ]]; then
     local yn
@@ -3314,27 +3518,30 @@ reality_keypair() {
 
 require_core_installed() {
   [[ -x "$BIN" ]] && return 0
-  warn "尚未安装 sing-box 内核，请先执行 1. 一键安装 Sing-box。"
+  if is_alpine; then
+    warn "尚未安装 sing-box 内核，请先执行菜单 13：NAT 轻量安装。"
+  else
+    warn "尚未安装 sing-box 内核，请先执行菜单 3：标准安装，或菜单 13：NAT 轻量安装。"
+  fi
   return 1
 }
 
 add_mixed() {
   local port username password
   choose_node_ip_version "Mixed" || return 1
-  port="$(ask_port "Mixed" 30000)"
-  username="$(ask_text "Mixed 用户名" "daimon")"
-  password="$(ask_text "Mixed 密码" "daimon")"
-  set_selected_protocol mixed "port=$port" "username=$username" "password=$password"
-  rebuild_configs
+  port="$(ask_port "Mixed" 30000)" || return 1
+  username="$(ask_text "Mixed 用户名" "daimon")" || return 1
+  password="$(ask_text "Mixed 密码" "daimon")" || return 1
+  apply_state_change config set_selected_protocol mixed "port=$port" "username=$username" "password=$password" || return 1
 }
 
 add_vless_reality() {
   local port uuid sni short_id keys private_key public_key
   require_core_installed || return 1
   choose_node_ip_version "Vless-reality" || return 1
-  port="$(ask_port "Vless-reality" "$(random_free_port)")"
-  uuid="$(ask_text "Vless-reality UUID" "$(rand_uuid)")"
-  sni="$(pick_sni "$(random_sni)")"
+  port="$(ask_port "Vless-reality" "$(random_free_port)")" || return 1
+  uuid="$(ask_text "Vless-reality UUID" "$(rand_uuid)")" || return 1
+  sni="$(pick_sni "$(random_sni)")" || return 1
   short_id="$(rand_hex 8)"
   keys="$(reality_keypair || true)"
   private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
@@ -3343,100 +3550,98 @@ add_vless_reality() {
     fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
     return 1
   fi
-  set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key"
-  rebuild_configs
+  apply_state_change config set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key" || return 1
 }
 
 add_vmess_ws() {
-  local port uuid yn tls
+  local port uuid yn tls answer
   choose_node_ip_version "Vmess-ws" || return 1
-  port="$(ask_port "Vmess-ws" "$(random_free_port)")"
-  uuid="$(ask_text "Vmess-ws UUID" "$(rand_uuid)")"
-  ask_yes_no "是否开启 VMess-WS TLS？" n && tls=true || tls=false
-  set_selected_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls"
-  rebuild_configs
+  port="$(ask_port "Vmess-ws" "$(random_free_port)")" || return 1
+  uuid="$(ask_text "Vmess-ws UUID" "$(rand_uuid)")" || return 1
+  if ask_yes_no "是否开启 VMess-WS TLS？" n; then
+    tls=true
+  else
+    answer=$?
+    ((answer == 1)) || return 1
+    tls=false
+  fi
+  apply_state_change config set_selected_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls" || return 1
 }
 
 add_hysteria2() {
-  local port password sni hop_start hop_end
+  local port password sni hop_start hop_end hopping
   choose_node_ip_version "Hysteria-2" || return 1
-  port="$(ask_port "Hysteria-2" "$(random_free_port)")"
-  password="$(ask_text "Hysteria-2 密码" "$(rand_uuid)")"
-  sni="$(pick_sni "$(random_sni)")"
-  IFS=$'\t' read -r hop_start hop_end < <(ask_hopping "Hysteria-2")
-  set_selected_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end"
-  rebuild_configs
+  port="$(ask_port "Hysteria-2" "$(random_free_port)")" || return 1
+  password="$(ask_text "Hysteria-2 密码" "$(rand_uuid)")" || return 1
+  sni="$(pick_sni "$(random_sni)")" || return 1
+  hopping="$(ask_hopping "Hysteria-2")" || return 1
+  IFS=$'\t' read -r hop_start hop_end <<<"$hopping"
+  apply_state_change config set_selected_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end" || return 1
 }
 
 add_tuic() {
   local port uuid password sni
   choose_node_ip_version "Tuic-v5" || return 1
-  port="$(ask_port "Tuic-v5" "$(random_free_port)")"
-  uuid="$(ask_text "Tuic-v5 UUID" "$(rand_uuid)")"
-  password="$(ask_text "Tuic-v5 密码" "$uuid")"
-  sni="$(pick_sni "$(random_sni)")"
-  set_selected_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end="
-  rebuild_configs
+  port="$(ask_port "Tuic-v5" "$(random_free_port)")" || return 1
+  uuid="$(ask_text "Tuic-v5 UUID" "$(rand_uuid)")" || return 1
+  password="$(ask_text "Tuic-v5 密码" "$uuid")" || return 1
+  sni="$(pick_sni "$(random_sni)")" || return 1
+  apply_state_change config set_selected_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end=" || return 1
 }
 
 add_anytls() {
   local port password sni
   choose_node_ip_version "Anytls" || return 1
-  port="$(ask_port "Anytls" "$(random_free_port)")"
-  password="$(ask_text "Anytls 密码" "$(rand_uuid)")"
-  sni="$(pick_sni "$(random_sni)")"
-  set_selected_protocol anytls "port=$port" "password=$password" "sni=$sni"
-  rebuild_configs
+  port="$(ask_port "Anytls" "$(random_free_port)")" || return 1
+  password="$(ask_text "Anytls 密码" "$(rand_uuid)")" || return 1
+  sni="$(pick_sni "$(random_sni)")" || return 1
+  apply_state_change config set_selected_protocol anytls "port=$port" "password=$password" "sni=$sni" || return 1
 }
 
 add_trojan() {
   local port password sni
   choose_node_ip_version "Trojan" || return 1
-  port="$(ask_port "Trojan" "$(random_free_port)")"
-  password="$(ask_text "Trojan 密码" "$(rand_uuid)")"
-  sni="$(pick_sni "$(random_sni)")"
-  set_selected_protocol trojan "port=$port" "password=$password" "sni=$sni"
-  rebuild_configs
+  port="$(ask_port "Trojan" "$(random_free_port)")" || return 1
+  password="$(ask_text "Trojan 密码" "$(rand_uuid)")" || return 1
+  sni="$(pick_sni "$(random_sni)")" || return 1
+  apply_state_change config set_selected_protocol trojan "port=$port" "password=$password" "sni=$sni" || return 1
 }
 
 add_shadowsocks() {
   local port password method
   choose_node_ip_version "Shadowsocks" || return 1
-  port="$(ask_port "Shadowsocks" "$(random_free_port)")"
-  password="$(ask_text "Shadowsocks 密码" "$(rand_uuid)")"
-  method="$(ask_text "Shadowsocks 加密方式" "aes-128-gcm")"
-  set_selected_protocol shadowsocks "port=$port" "password=$password" "method=$method"
-  rebuild_configs
+  port="$(ask_port "Shadowsocks" "$(random_free_port)")" || return 1
+  password="$(ask_text "Shadowsocks 密码" "$(rand_uuid)")" || return 1
+  method="$(ask_text "Shadowsocks 加密方式" "aes-128-gcm")" || return 1
+  apply_state_change config set_selected_protocol shadowsocks "port=$port" "password=$password" "method=$method" || return 1
 }
 
 add_vmess_tcp() {
   local port uuid
   choose_node_ip_version "Vmess-tcp" || return 1
-  port="$(ask_port "Vmess-tcp" "$(random_free_port)")"
-  uuid="$(ask_text "Vmess-tcp UUID" "$(rand_uuid)")"
-  set_selected_protocol vmess_tcp "port=$port" "uuid=$uuid"
-  rebuild_configs
+  port="$(ask_port "Vmess-tcp" "$(random_free_port)")" || return 1
+  uuid="$(ask_text "Vmess-tcp UUID" "$(rand_uuid)")" || return 1
+  apply_state_change config set_selected_protocol vmess_tcp "port=$port" "uuid=$uuid" || return 1
 }
 
 add_vmess_http() {
   local port uuid host path
   choose_node_ip_version "Vmess-http" || return 1
-  port="$(ask_port "Vmess-http" "$(random_free_port)")"
-  uuid="$(ask_text "Vmess-http UUID" "$(rand_uuid)")"
-  host="$(pick_sni "$(random_sni)")"
-  path="$(ask_text "Vmess-http 路径" "/vmess-http")"
+  port="$(ask_port "Vmess-http" "$(random_free_port)")" || return 1
+  uuid="$(ask_text "Vmess-http UUID" "$(rand_uuid)")" || return 1
+  host="$(pick_sni "$(random_sni)")" || return 1
+  path="$(ask_text "Vmess-http 路径" "/vmess-http")" || return 1
   [[ "$path" == /* ]] || path="/$path"
-  set_selected_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path"
-  rebuild_configs
+  apply_state_change config set_selected_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path" || return 1
 }
 
 add_all_protocols() {
   local proto needs_ip=false
-  ensure_state
-  lite_mode && {
+  ensure_state || return 1
+  if is_alpine || lite_mode; then
     fail "NAT 轻量模式只支持 VLESS Reality；如需其他协议，请先执行标准安装升级。"
     return 1
-  }
+  fi
   require_core_installed || return 1
   maybe_set_node_prefix
   for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls; do
@@ -3446,26 +3651,30 @@ add_all_protocols() {
     fi
   done
   [[ "$needs_ip" == "false" ]] || choose_node_ip_version "一键添加协议" || return 1
-  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon"
+  apply_state_change config add_missing_protocols || return 1
+  info "一键协议已生成。"
+  show_protocol_details
+}
+
+add_missing_protocols() {
+  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon" || return 1
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] || {
     local keys private_key public_key
     keys="$(reality_keypair || true)"
     private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
     public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
     [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"; return 1; }
-    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key"
+    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key" || return 1
   }
-  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_selected_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false"
-  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_selected_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end="
+  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_selected_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false" || return 1
+  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_selected_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end=" || return 1
   if [[ "$(proto_value tuic enabled false)" != "true" ]]; then
     local tuic_uuid
     tuic_uuid="$(rand_uuid)"
-    set_selected_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end="
+    set_selected_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end=" || return 1
   fi
-  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_selected_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)"
-  rebuild_configs
-  info "一键协议已生成。"
-  show_protocol_details
+  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_selected_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" || return 1
+  return 0
 }
 
 install_sing_box() {
@@ -3474,16 +3683,16 @@ install_sing_box() {
     fail "Alpine 仅支持菜单 13 的 NAT 轻量 VLESS Reality 安装。"
     return 1
   fi
-  install_dependencies standard
-  ensure_dirs
-  ensure_state
-  set_state_value install_mode standard
-  download_core standard
-  ensure_cert
-  write_base_configs
-  write_sub_server
-  write_services standard
-  install_shortcuts
+  install_dependencies standard || return 1
+  ensure_dirs || return 1
+  ensure_state || return 1
+  set_state_value install_mode standard || return 1
+  download_core standard || return 1
+  ensure_cert || return 1
+  rebuild_configs || return 1
+  write_sub_server || return 1
+  write_services standard || return 1
+  install_shortcuts || return 1
   sync_ufw_ports
   systemctl enable sing-box sing-box-sub >/dev/null 2>&1 || true
   if systemctl restart sing-box sing-box-sub >/dev/null 2>&1 &&
@@ -3503,22 +3712,22 @@ lite_state_is_fresh() {
 
 install_nat_lite() {
   need_root
-  install_dependencies lite
-  ensure_state
+  install_dependencies lite || return 1
+  ensure_state || return 1
   lite_state_is_fresh || {
     fail "NAT 轻量安装只接受尚未添加协议的状态，请先使用标准模式或清理现有协议。"
     return 1
   }
-  ensure_dirs
-  download_core lite || return 1
-  set_state_value install_mode lite
-  write_base_configs
-  write_services lite
-  install_shortcuts
-  sync_ufw_ports
-  managed_service_enable sing-box || true
-  maybe_set_node_prefix
+  ensure_dirs || return 1
+  maybe_set_node_prefix || return 1
   choose_node_ip_version "NAT 轻量 VLESS" || return 1
+  download_core lite || return 1
+  set_state_value install_mode lite || return 1
+  write_base_configs || return 1
+  write_services lite || return 1
+  install_shortcuts || return 1
+  sync_ufw_ports
+  managed_service_enable sing-box || return 1
   local keys private_key public_key
   keys="$(reality_keypair || true)"
   private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
@@ -3527,14 +3736,13 @@ install_nat_lite() {
     fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
     return 1
   }
-  set_selected_protocol vless_reality \
+  apply_state_change config set_selected_protocol vless_reality \
     "port=$(random_free_port)" \
     "uuid=$(rand_uuid)" \
     "sni=$(random_sni)" \
     "short_id=$(rand_hex 8)" \
     "private_key=$private_key" \
-    "public_key=$public_key"
-  rebuild_configs || return 1
+    "public_key=$public_key" || return 1
   if managed_service_restart sing-box >/dev/null 2>&1 && managed_service_active sing-box; then
     info "NAT 轻量 VLESS Reality 已安装并运行。外部端口请在 NAT 页面映射为同一端口。"
     show_protocol_details
@@ -3586,7 +3794,7 @@ uninstall_sing_box() {
   rm -rf "$ROOT/bin" "$CONF" "$CERT" "$SUB" "$LOG"
   rm -f "$STATE" "$STATE.tmp" "$SUB_SERVER"
   remove_alpine_managed_packages false
-  ensure_dirs
+  ensure_dirs || return 1
   info "Sing-box 和所有协议已卸载，管理脚本已保留。"
 }
 
@@ -3615,7 +3823,7 @@ delete_script() {
 update_script() {
   need_root
   local tmp latest
-  ensure_dirs
+  ensure_dirs || return 1
   tmp="$ROOT/sb.sh.update"
   info "正在下载最新脚本..."
   if ! fetch_latest_script >"$tmp"; then
@@ -3629,7 +3837,12 @@ update_script() {
     return 1
   fi
   latest="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
-  install -m 0755 "$tmp" "$SCRIPT"
+  if [[ -z "$latest" || "$(printf '%s\n%s\n' "$latest" "$SCRIPT_VERSION" | sort -V | tail -n1)" != "$latest" ]]; then
+    rm -f "$tmp"
+    warn "下载版本低于当前版本或缺少版本信息，未更新。"
+    return 1
+  fi
+  chmod 0755 "$tmp" && mv -f "$tmp" "$SCRIPT" || return 1
   rm -f "$tmp"
   ln -sf "$SCRIPT" /usr/local/bin/sb
   ln -sf "$SCRIPT" /usr/local/bin/sing-box
@@ -3646,17 +3859,21 @@ update_script() {
 refresh_installed() {
   need_root
   local sing_box_active=false
-  ensure_state
-  ensure_dirs
+  ensure_state || return 1
+  ensure_dirs || return 1
   if lite_mode; then
-    write_services lite
+    rebuild_configs || return 1
+    write_services lite || return 1
+    if managed_service_active sing-box; then
+      managed_service_restart sing-box && managed_service_active sing-box || return 1
+    fi
     return 0
   fi
   install_optional_qrencode
   managed_service_active sing-box 2>/dev/null && sing_box_active=true
-  rebuild_configs
-  write_sub_server
-  write_services standard
+  rebuild_configs || return 1
+  write_sub_server || return 1
+  write_services standard || return 1
   if [[ "$sing_box_active" == "true" ]]; then
     if ! "$BIN" check -C "$CONF" >/dev/null 2>&1; then
       fail "sing-box 配置检查失败，未应用更新。"
@@ -3666,10 +3883,7 @@ refresh_installed() {
     managed_service_restart sing-box >/dev/null 2>&1 || return 1
     managed_service_active sing-box || return 1
   fi
-  # A slow subscription bind must not fail the whole refresh: update_script
-  # treats a nonzero status as "update failed" even though configs, services
-  # and the core were all applied successfully.
-  restart_sub_service || warn "订阅服务重启较慢或失败，请在运行管理中查看状态。"
+  restart_sub_service || { fail "订阅服务重启失败，请在运行管理中查看状态。"; return 1; }
   return 0
 }
 
@@ -3685,74 +3899,68 @@ systemd_unit_exists() {
 }
 
 restart_if_running() {
-  if systemd_unit_exists sing-box.service; then
-    if has_protocols; then
-      if [[ ! -x "$BIN" ]]; then
-        warn "sing-box 内核不存在，未启动服务。"
-      elif ! "$BIN" check -C "$CONF" >/dev/null 2>&1; then
-        fail "sing-box 配置检查失败，未重启服务。"
-        "$BIN" check -C "$CONF" || true
-      else
-        is_alpine || systemctl reset-failed sing-box >/dev/null 2>&1 || true
-        if managed_service_restart sing-box >/dev/null 2>&1 && managed_service_active sing-box; then
-          info "Sing-box 已应用新配置并运行。"
-        else
-          fail "Sing-box 重启失败，请查看运行管理日志。"
-          managed_service_status sing-box 2>/dev/null || true
-        fi
-      fi
+  local rc=0
+  if ! systemd_unit_exists sing-box.service; then
+    warn "Sing-box 服务未安装，请先安装。"
+    return 1
+  fi
+  if has_protocols; then
+    [[ -x "$BIN" ]] || { fail "sing-box 内核不存在。"; return 1; }
+    "$BIN" check -C "$CONF" || { fail "配置检查失败，未重启服务。"; return 1; }
+    if managed_service_restart sing-box && managed_service_active sing-box; then
+      info "Sing-box 已应用新配置并运行。"
     else
-      managed_service_stop sing-box >/dev/null 2>&1 || true
-      is_alpine || systemctl reset-failed sing-box >/dev/null 2>&1 || true
-      info "未启用协议，Sing-box 已停止。"
+      fail "Sing-box 重启失败，请查看运行管理日志。"
+      rc=1
     fi
+  else
+    managed_service_stop sing-box || { fail "Sing-box 停止失败。"; return 1; }
+    info "未启用协议，Sing-box 已停止。"
   fi
-  if systemd_unit_exists sing-box-sub.service; then
-    systemctl reset-failed sing-box-sub >/dev/null 2>&1 || true
-    restart_sub_service || warn "订阅服务重启失败。"
+  if ! lite_mode && ! is_alpine && systemd_unit_exists sing-box-sub.service; then
+    restart_sub_service || { fail "订阅服务重启失败。"; rc=1; }
   fi
+  return "$rc"
 }
 
 add_protocol_menu() {
-  require_core_installed || return 0
-  lite_mode && {
-    warn "NAT 轻量模式只运行已创建的 VLESS Reality；如需其他协议，请先执行标准安装升级。"
-    return 0
-  }
+  require_core_installed || return 1
   title "添加协议"
-  printf "1. Mixed\n2. Vless-reality\n3. Vmess-ws\n4. Hysteria-2\n5. Tuic-v5\n6. Anytls\n7. Trojan\n8. Shadowsocks\n9. Vmess-tcp\n10. Vmess-http\n0. 返回\n"
-  local choice
-  choice="$(ask_menu "请选择: " 10)"
-  [[ "$choice" == "0" ]] && return 1
-  maybe_set_node_prefix
-  case "$choice" in
-    1) add_mixed ;;
-    2) add_vless_reality ;;
-    3) add_vmess_ws ;;
-    4) add_hysteria2 ;;
-    5) add_tuic ;;
-    6) add_anytls ;;
-    7) add_trojan ;;
-    8) add_shadowsocks ;;
-    9) add_vmess_tcp ;;
-    10) add_vmess_http ;;
+  protocol_menu_items missing
+  ((${#AVAILABLE_PROTOCOLS[@]})) || { info "当前模式支持的协议均已添加，请使用修改协议。"; return 1; }
+  printf '0. 返回\n'
+  local choice proto
+  choice="$(ask_menu "请选择: " "${#AVAILABLE_PROTOCOLS[@]}")"
+  [[ "$choice" != 0 ]] || return 1
+  proto="${AVAILABLE_PROTOCOLS[choice-1]}"
+  maybe_set_node_prefix || return 1
+  case "$proto" in
+    mixed) add_mixed || return 1 ;;
+    vless_reality) add_vless_reality || return 1 ;;
+    vmess_ws) add_vmess_ws || return 1 ;;
+    hysteria2) add_hysteria2 || return 1 ;;
+    tuic) add_tuic || return 1 ;;
+    anytls) add_anytls || return 1 ;;
+    trojan) add_trojan || return 1 ;;
+    shadowsocks) add_shadowsocks || return 1 ;;
+    vmess_tcp) add_vmess_tcp || return 1 ;;
+    vmess_http) add_vmess_http || return 1 ;;
   esac
-  restart_if_running
+  restart_if_running || return 1
   info "协议已添加。"
   show_protocol_details
-  return 0
 }
 
 change_protocol_ip_version() {
   local proto="$1" label="$2"
   choose_node_ip_version "$label" || return 1
-  set_protocol "$proto" "ip_version=$SELECTED_IP_VERSION" "endpoint_host=$SELECTED_ENDPOINT_HOST" || return 1
+  apply_state_change subscription set_protocol "$proto" "ip_version=$SELECTED_IP_VERSION" "endpoint_host=$SELECTED_ENDPOINT_HOST" || return 1
   ADDRESS_ONLY_CHANGE=true
 }
 
 set_all_protocol_ip_version() {
   local mode="$1" host="$2" tmp
-  ensure_state
+  ensure_state || return 1
   if is_alpine; then
     tmp="$(mktemp "$ROOT/.state.XXXXXX")" || return 1
     jq --arg mode "$mode" --arg host "$host" '
@@ -3790,61 +3998,52 @@ change_all_protocol_ip_version() {
   done
   [[ "$found" == "true" ]] || { warn "尚未添加协议。"; return 1; }
   choose_node_ip_version "全部已添加协议" || return 1
-  set_all_protocol_ip_version "$SELECTED_IP_VERSION" "$SELECTED_ENDPOINT_HOST" || return 1
-  generate_subscription || return 1
+  apply_state_change subscription set_all_protocol_ip_version "$SELECTED_IP_VERSION" "$SELECTED_ENDPOINT_HOST" || return 1
   info "全部已添加协议的客户端连接地址已更新。"
   show_protocol_details
 }
 
+change_protocol_port() {
+  local proto="$1" label="$2" old_port port
+  old_port="$(proto_value "$proto" port)"
+  port="$(ask_port "$label" "$old_port" "$old_port")" || return 1
+  [[ "$port" != "$old_port" ]] || { info "端口未变化。"; return 1; }
+  apply_state_change config set_protocol "$proto" "port=$port"
+}
+
 change_protocol_config() {
-  ensure_state
-  require_core_installed || return 0
+  require_core_installed || return 1
   ADDRESS_ONLY_CHANGE=false
   title "更改协议配置"
-  printf "1. Mixed\n2. Vless-reality\n3. Vmess-ws\n4. Hysteria-2\n5. Tuic-v5\n6. Anytls\n7. Trojan\n8. Shadowsocks\n9. Vmess-tcp\n10. Vmess-http\n11. 修改全部已添加协议的连接地址\n0. 返回\n"
-  local proto label choice field port value hop_start hop_end
-  choice="$(ask_menu "请选择协议: " 11)"
-  case "$choice" in
-    1) proto=mixed; label=Mixed ;;
-    2) proto=vless_reality; label=Vless-reality ;;
-    3) proto=vmess_ws; label=Vmess-ws ;;
-    4) proto=hysteria2; label=Hysteria-2 ;;
-    5) proto=tuic; label=Tuic-v5 ;;
-    6) proto=anytls; label=Anytls ;;
-    7) proto=trojan; label=Trojan ;;
-    8) proto=shadowsocks; label=Shadowsocks ;;
-    9) proto=vmess_tcp; label=Vmess-tcp ;;
-    10) proto=vmess_http; label=Vmess-http ;;
-    11) change_all_protocol_ip_version; return $? ;;
-    0) return 1 ;;
-  esac
-  protocol_exists "$proto" || { warn "$label 尚未添加。"; return 0; }
+  select_existing_protocol || return 1
+  local proto="$SELECTED_PROTOCOL" label field port value hop_start hop_end hopping
+  label="$(node_base_name "$proto")"
   case "$proto" in
     mixed)
       printf "1. 修改端口\n2. 修改用户名\n3. 修改密码\n4. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      field="$(ask_menu "请选择: " 4)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(proto_value mixed port 30000)" "$(proto_value mixed port)")"; set_protocol mixed "port=$port" ;;
-        2) value="$(ask_text "Mixed 用户名" "$(proto_value mixed username daimon)")"; set_protocol mixed "username=$value" ;;
-        3) value="$(ask_text "Mixed 密码" "$(proto_value mixed password daimon)")"; set_protocol mixed "password=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Mixed 用户名" "$(proto_value mixed username daimon)")" || return 1; apply_state_change config set_protocol mixed "username=$value" || return 1 ;;
+        3) value="$(ask_text "Mixed 密码" "$(proto_value mixed password daimon)")" || return 1; apply_state_change config set_protocol mixed "password=$value" || return 1 ;;
         4) change_protocol_ip_version mixed "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vless_reality)
       printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 重新生成 Reality 密钥\n5. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 5)"
+      field="$(ask_menu "请选择: " 5)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vless_reality port)")" "$(proto_value vless_reality port)")"; set_protocol vless_reality "port=$port" ;;
-        2) value="$(ask_text "Vless-reality UUID" "$(proto_value vless_reality uuid)")"; set_protocol vless_reality "uuid=$value" ;;
-        3) value="$(pick_sni "$(proto_value vless_reality sni)")"; set_protocol vless_reality "sni=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Vless-reality UUID" "$(proto_value vless_reality uuid)")" || return 1; apply_state_change config set_protocol vless_reality "uuid=$value" || return 1 ;;
+        3) value="$(pick_sni "$(proto_value vless_reality sni)")" || return 1; apply_state_change config set_protocol vless_reality "sni=$value" || return 1 ;;
         4)
           local keys private_key public_key
           keys="$(reality_keypair || true)"
           private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
           public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
           [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败。"; return 0; }
-          set_protocol vless_reality "private_key=$private_key" "public_key=$public_key" "short_id=$(rand_hex 8)"
+          apply_state_change config set_protocol vless_reality "private_key=$private_key" "public_key=$public_key" "short_id=$(rand_hex 8)" || return 1
           ;;
         5) change_protocol_ip_version vless_reality "$label" || return 1 ;;
         0) return 1 ;;
@@ -3852,236 +4051,245 @@ change_protocol_config() {
       ;;
     vmess_ws)
       printf "1. 修改端口\n2. 修改 UUID\n3. 开关 TLS\n4. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      field="$(ask_menu "请选择: " 4)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_ws port)")" "$(proto_value vmess_ws port)")"; set_protocol vmess_ws "port=$port" ;;
-        2) value="$(ask_text "Vmess-ws UUID" "$(proto_value vmess_ws uuid)")"; set_protocol vmess_ws "uuid=$value" ;;
-        3) ask_yes_no "是否开启 VMess-WS TLS？" "$([[ "$(proto_value vmess_ws tls false)" == "true" ]] && printf y || printf n)" && set_protocol vmess_ws "tls=true" || set_protocol vmess_ws "tls=false" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Vmess-ws UUID" "$(proto_value vmess_ws uuid)")" || return 1; apply_state_change config set_protocol vmess_ws "uuid=$value" || return 1 ;;
+        3)
+          printf '1. 开启 TLS\n2. 关闭 TLS\n0. 返回\n'
+          value="$(ask_menu "请选择: " 2)"
+          [[ "$value" != 0 ]] || return 1
+          [[ "$value" == 1 ]] && value=true || value=false
+          apply_state_change config set_protocol vmess_ws "tls=$value" || return 1
+          ;;
         4) change_protocol_ip_version vmess_ws "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     hysteria2)
       printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 设置跳跃端口\n5. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 5)"
+      field="$(ask_menu "请选择: " 5)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value hysteria2 port)")" "$(proto_value hysteria2 port)")"; set_protocol hysteria2 "port=$port" ;;
-        2) value="$(ask_text "Hysteria-2 密码" "$(proto_value hysteria2 password)")"; set_protocol hysteria2 "password=$value" ;;
-        3) value="$(pick_sni "$(proto_value hysteria2 sni "${SNI_OPTIONS[0]}")")"; set_protocol hysteria2 "sni=$value" ;;
-        4) IFS=$'\t' read -r hop_start hop_end < <(ask_hopping "$label" "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")"); set_protocol hysteria2 "hop_start=$hop_start" "hop_end=$hop_end" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Hysteria-2 密码" "$(proto_value hysteria2 password)")" || return 1; apply_state_change config set_protocol hysteria2 "password=$value" || return 1 ;;
+        3) value="$(pick_sni "$(proto_value hysteria2 sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol hysteria2 "sni=$value" || return 1 ;;
+        4) hopping="$(ask_hopping "$label" "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")")" || return 1; IFS=$'\t' read -r hop_start hop_end <<<"$hopping"; apply_state_change config set_protocol hysteria2 "hop_start=$hop_start" "hop_end=$hop_end" || return 1 ;;
         5) change_protocol_ip_version hysteria2 "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     tuic)
       printf "1. 修改端口\n2. 修改 UUID\n3. 修改密码\n4. 修改 SNI\n5. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 5)"
+      field="$(ask_menu "请选择: " 5)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value tuic port)")" "$(proto_value tuic port)")"; set_protocol tuic "port=$port" ;;
-        2) value="$(ask_text "Tuic-v5 UUID" "$(proto_value tuic uuid)")"; set_protocol tuic "uuid=$value" ;;
-        3) value="$(ask_text "Tuic-v5 密码" "$(proto_value tuic password)")"; set_protocol tuic "password=$value" ;;
-        4) value="$(pick_sni "$(proto_value tuic sni "${SNI_OPTIONS[0]}")")"; set_protocol tuic "sni=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Tuic-v5 UUID" "$(proto_value tuic uuid)")" || return 1; apply_state_change config set_protocol tuic "uuid=$value" || return 1 ;;
+        3) value="$(ask_text "Tuic-v5 密码" "$(proto_value tuic password)")" || return 1; apply_state_change config set_protocol tuic "password=$value" || return 1 ;;
+        4) value="$(pick_sni "$(proto_value tuic sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol tuic "sni=$value" || return 1 ;;
         5) change_protocol_ip_version tuic "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     anytls)
       printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      field="$(ask_menu "请选择: " 4)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value anytls port)")" "$(proto_value anytls port)")"; set_protocol anytls "port=$port" ;;
-        2) value="$(ask_text "Anytls 密码" "$(proto_value anytls password)")"; set_protocol anytls "password=$value" ;;
-        3) value="$(pick_sni "$(proto_value anytls sni "${SNI_OPTIONS[0]}")")"; set_protocol anytls "sni=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Anytls 密码" "$(proto_value anytls password)")" || return 1; apply_state_change config set_protocol anytls "password=$value" || return 1 ;;
+        3) value="$(pick_sni "$(proto_value anytls sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol anytls "sni=$value" || return 1 ;;
         4) change_protocol_ip_version anytls "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     trojan)
       printf "1. 修改端口\n2. 修改密码\n3. 修改 SNI\n4. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      field="$(ask_menu "请选择: " 4)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value trojan port)")" "$(proto_value trojan port)")"; set_protocol trojan "port=$port" ;;
-        2) value="$(ask_text "Trojan 密码" "$(proto_value trojan password)")"; set_protocol trojan "password=$value" ;;
-        3) value="$(pick_sni "$(proto_value trojan sni "${SNI_OPTIONS[0]}")")"; set_protocol trojan "sni=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Trojan 密码" "$(proto_value trojan password)")" || return 1; apply_state_change config set_protocol trojan "password=$value" || return 1 ;;
+        3) value="$(pick_sni "$(proto_value trojan sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol trojan "sni=$value" || return 1 ;;
         4) change_protocol_ip_version trojan "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     shadowsocks)
       printf "1. 修改端口\n2. 修改密码\n3. 修改加密方式\n4. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 4)"
+      field="$(ask_menu "请选择: " 4)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value shadowsocks port)")" "$(proto_value shadowsocks port)")"; set_protocol shadowsocks "port=$port" ;;
-        2) value="$(ask_text "Shadowsocks 密码" "$(proto_value shadowsocks password)")"; set_protocol shadowsocks "password=$value" ;;
-        3) value="$(ask_text "Shadowsocks 加密方式" "$(proto_value shadowsocks method aes-128-gcm)")"; set_protocol shadowsocks "method=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Shadowsocks 密码" "$(proto_value shadowsocks password)")" || return 1; apply_state_change config set_protocol shadowsocks "password=$value" || return 1 ;;
+        3) value="$(ask_text "Shadowsocks 加密方式" "$(proto_value shadowsocks method aes-128-gcm)")" || return 1; apply_state_change config set_protocol shadowsocks "method=$value" || return 1 ;;
         4) change_protocol_ip_version shadowsocks "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vmess_tcp)
       printf "1. 修改端口\n2. 修改 UUID\n3. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 3)"
+      field="$(ask_menu "请选择: " 3)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_tcp port)")" "$(proto_value vmess_tcp port)")"; set_protocol vmess_tcp "port=$port" ;;
-        2) value="$(ask_text "Vmess-tcp UUID" "$(proto_value vmess_tcp uuid)")"; set_protocol vmess_tcp "uuid=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Vmess-tcp UUID" "$(proto_value vmess_tcp uuid)")" || return 1; apply_state_change config set_protocol vmess_tcp "uuid=$value" || return 1 ;;
         3) change_protocol_ip_version vmess_tcp "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
     vmess_http)
       printf "1. 修改端口\n2. 修改 UUID\n3. 修改 Host\n4. 修改路径\n5. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 5)"
+      field="$(ask_menu "请选择: " 5)" || return 1
       case "$field" in
-        1) port="$(ask_port "$label" "$(random_free_port "$(proto_value vmess_http port)")" "$(proto_value vmess_http port)")"; set_protocol vmess_http "port=$port" ;;
-        2) value="$(ask_text "Vmess-http UUID" "$(proto_value vmess_http uuid)")"; set_protocol vmess_http "uuid=$value" ;;
-        3) value="$(pick_sni "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")")"; set_protocol vmess_http "host=$value" ;;
-        4) value="$(ask_text "Vmess-http 路径" "$(proto_value vmess_http path /vmess-http)")"; [[ "$value" == /* ]] || value="/$value"; set_protocol vmess_http "path=$value" ;;
+        1) change_protocol_port "$proto" "$label" || return 1 ;;
+        2) value="$(ask_text "Vmess-http UUID" "$(proto_value vmess_http uuid)")" || return 1; apply_state_change config set_protocol vmess_http "uuid=$value" || return 1 ;;
+        3) value="$(pick_sni "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol vmess_http "host=$value" || return 1 ;;
+        4) value="$(ask_text "Vmess-http 路径" "$(proto_value vmess_http path /vmess-http)")" || return 1; [[ "$value" == /* ]] || value="/$value"; apply_state_change config set_protocol vmess_http "path=$value" || return 1 ;;
         5) change_protocol_ip_version vmess_http "$label" || return 1 ;;
         0) return 1 ;;
       esac
       ;;
   esac
-  if [[ "$ADDRESS_ONLY_CHANGE" == "true" ]]; then
-    generate_subscription || return 1
-  else
-    rebuild_configs || return 1
-    restart_if_running
+  if [[ "$ADDRESS_ONLY_CHANGE" != "true" ]]; then
+    restart_if_running || return 1
   fi
   info "配置已更新。"
   show_protocol_details
   return 0
 }
 
+
+
 change_subscription_config() {
-  ensure_state
-  lite_mode && {
-    warn "NAT 轻量模式未启用 HTTP/HTTPS 订阅服务。"
-    return 0
-  }
-  local choice old_port new_port old_token new_token input domain endpoint_host
+  require_core_installed || return 1
+  local choice old_port new_port new_token input domain endpoint_host http_enabled=true
+  if is_alpine || lite_mode; then http_enabled=false; fi
   title "更改综合订阅配置"
-  endpoint_host="$(state_value sub_endpoint_host "")"
-  printf "当前订阅端口:%s\nHTTP/IP订阅连接地址:%s\n当前订阅token:%s\n当前HTTPS订阅域名:%s\nHTTPS状态:%s\n\n" \
-    "$(state_value sub_port 2096)" "${endpoint_host:-自动}" "$(state_value token)" "$(state_value sub_domain "未设置")" \
-    "$([[ "$(state_value sub_tls false)" == "true" ]] && printf '已配置' || printf '未配置')"
-  show_subscription_links
-  printf "\n1. 修改综合订阅端口\n2. 指定或重新生成 token\n3. 设置/更改 HTTPS 订阅域名\n4. 删除 HTTPS 订阅域名配置\n5. 修改 HTTP/IP 订阅连接地址\n0. 返回\n"
-  choice="$(ask_menu "请选择: " 5)"
+  printf '节点连接地址决定客户端连接哪个 IPv4/IPv6；订阅下载地址不改变节点或出站。\n'
+  if [[ "$http_enabled" == true ]]; then
+    endpoint_host="$(state_value sub_endpoint_host "")"
+    domain="$(state_value sub_domain "")"
+    printf '当前订阅端口:%s\nHTTP/IP订阅地址:%s\n当前HTTPS域名:%s\n\n' \
+      "$(state_value sub_port 2096)" "${endpoint_host:-自动}" "${domain:-未设置}"
+    show_subscription_links
+    printf '\n1. 修改综合订阅端口\n2. 指定或重新生成 token（旧链接将失效）\n3. 设置/更改 HTTPS 订阅域名\n'
+    [[ -z "$domain" ]] || printf '4. 删除 HTTPS 订阅域名配置\n'
+    printf '5. 修改 HTTP/IP 订阅下载地址\n'
+  else
+    printf 'NAT 轻量模式不提供 HTTP/HTTPS 订阅，以下操作仅更新节点链接。\n'
+  fi
+  printf '6. 切换节点连接地址：IPv4 / IPv6 / 双栈 / 手动地址（单协议或全部）\n0. 返回\n'
+  while true; do
+    choice="$(ask_menu "请选择: " 6)"
+    [[ "$choice" != 0 ]] || return 1
+    if [[ "$http_enabled" == false && "$choice" != 6 ]] || [[ "$choice" == 4 && -z "${domain:-}" ]]; then
+      warn "请选择当前菜单显示的编号。"
+      continue
+    fi
+    break
+  done
   case "$choice" in
     1)
       old_port="$(state_value sub_port 2096)"
-      new_port="$(ask_port "综合订阅" "$old_port" "$old_port")"
-      [[ "$new_port" == "$old_port" ]] && { info "订阅端口未变化。"; return 0; }
-      ufw_active && ufw_delete_rule "$old_port"
-      set_state_value sub_port "$new_port"
-      write_sub_server
-      generate_subscription
-      sync_ufw_ports
-      restart_sub_service || true
-      if [[ -n "$(state_value sub_domain "")" && "$(state_value sub_tls false)" == "true" ]]; then
-        write_nginx_subscription_config "$(state_value sub_domain)" "$new_port" || warn "HTTPS 订阅 nginx 反代端口同步失败，请重新配置 HTTPS 订阅域名。"
+      new_port="$(ask_port "综合订阅" "$old_port" "$old_port")" || return 1
+      [[ "$new_port" != "$old_port" ]] || { info "订阅端口未变化。"; return 0; }
+      apply_state_change subscription set_state_value sub_port "$new_port" || return 1
+      write_sub_server || return 1
+      restart_sub_service || { fail "订阅服务启动失败，请检查端口和日志。"; return 1; }
+      sync_ufw_ports || return 1
+      if [[ -n "$domain" && "$(state_value sub_tls false)" == true ]]; then
+        write_nginx_subscription_config "$domain" "$new_port" || return 1
       fi
       info "综合订阅端口已更新为 $new_port。"
       ;;
     2)
-      old_token="$(state_value token)"
       while true; do
-        # Empty input means "generate one", which EOF satisfies too.
-        safe_read "请输入新 token，直接回车随机生成: " input || true
+        safe_read "请输入新 token，回车随机生成（0 返回）: " input || return 1
+        [[ "$input" != 0 ]] || return 1
         new_token="${input:-$(rand_token)}"
-        if valid_token "$new_token"; then
-          break
-        fi
+        valid_token "$new_token" && break
         warn "token 只能包含字母和数字。"
       done
-      rm -f "$SUB/$old_token" "$SUB/$old_token.v2rayn" "$SUB/$old_token.clash" "$SUB/$old_token.raw"
-      set_state_value token "$new_token"
-      generate_subscription
-      restart_sub_service || true
-      info "综合订阅 token 已更新。"
+      apply_state_change subscription set_state_value token "$new_token" || return 1
+      info "综合订阅 token 已更新，旧链接已失效。"
       ;;
     3)
       while true; do
-        # No domain can be guessed, so EOF backs out to the menu.
-        safe_read "请输入 HTTPS 订阅域名: " domain || return 1
-        if [[ -n "$domain" ]] && valid_domain "$domain"; then
-          break
-        fi
-        warn "域名不能为空，请输入有效域名。"
+        safe_read "请输入 HTTPS 订阅域名（0 返回）: " domain || return 1
+        [[ "$domain" != 0 ]] || return 1
+        valid_domain "$domain" && break
+        warn "请输入有效域名。"
       done
       configure_https_subscription_domain "$domain" || return 1
       ;;
     4)
-      ask_yes_no "确认删除 HTTPS 订阅域名配置、nginx 反代和该域名证书？" n || return 1
-      delete_https_subscription_domain
+      ask_yes_no "确认删除 HTTPS 域名配置、nginx 反代和该域名证书？" n || return 1
+      delete_https_subscription_domain || return 1
       ;;
     5)
       while true; do
-        safe_read "请输入 HTTP/IP 订阅连接 IPv4、IPv6 或域名，直接回车恢复自动: " input || return 1
-        if [[ -z "$input" ]]; then
-          set_state_value sub_endpoint_host ""
-          info "HTTP/IP 订阅连接地址已恢复自动选择。"
-          return 0
-        fi
-        if endpoint_host="$(endpoint_host_value "$input")"; then
-          set_state_value sub_endpoint_host "$endpoint_host"
-          info "HTTP/IP 订阅连接地址已更新为 $endpoint_host。"
-          return 0
-        fi
-        warn "地址格式错误，请输入 IPv4、IPv6 或域名，不要包含协议、端口或路径。"
+        safe_read "请输入订阅下载 IPv4、IPv6 或域名，回车恢复自动（0 返回）: " input || return 1
+        [[ "$input" != 0 ]] || return 1
+        if [[ -z "$input" ]]; then endpoint_host=""; break; fi
+        if endpoint_host="$(endpoint_host_value "$input")"; then break; fi
+        warn "地址格式错误，不要包含协议、端口或路径。"
       done
+      set_state_value sub_endpoint_host "$endpoint_host" || return 1
+      info "订阅下载地址已更新，节点连接地址不变。"
       ;;
-    0) return 1 ;;
+    6)
+      title "选择需要切换地址的协议"
+      select_existing_protocol true || return 1
+      if [[ "$SELECTED_PROTOCOL" == all ]]; then
+        change_all_protocol_ip_version || return 1
+      else
+        change_protocol_ip_version "$SELECTED_PROTOCOL" "$(node_base_name "$SELECTED_PROTOCOL")" || return 1
+        info "节点连接地址已更新，端口和认证信息未改变。"
+        show_protocol_details
+      fi
+      return 0
+      ;;
   esac
-  printf "\n当前订阅链接如下：\n"
+  printf '\n当前订阅链接如下：\n'
   show_subscription_links
-  printf "\n"
-  return 0
 }
 
 delete_protocol_menu() {
-  local input item proto yn protocols=() deleted=0
+  require_core_installed || return 1
+  local input item proto choice max invalid protocols=()
   title "删除协议"
-  printf "1. Mixed\n2. Vless-reality\n3. Vmess-ws\n4. Hysteria-2\n5. Tuic-v5\n6. Anytls\n7. Trojan\n8. Shadowsocks\n9. Vmess-tcp\n10. Vmess-http\n11. 删除所有协议\n0. 返回\n"
-  # EOF behaves like the documented "0. 返回" choice.
-  safe_read "请选择，可多选，如 1 3 5 或 1,3,5: " input || return 1
-  input="${input//,/ }"
-  [[ "$input" =~ (^|[[:space:]])0($|[[:space:]]) ]] && return 1
-  if [[ "$input" =~ (^|[[:space:]])11($|[[:space:]]) ]]; then
-    protocols=(mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http)
-  else
+  protocol_menu_items
+  max=${#AVAILABLE_PROTOCOLS[@]}
+  ((max)) || { warn "尚未添加协议。"; return 1; }
+  printf '%s. 删除所有已添加协议\n0. 返回\n' "$((max+1))"
+  while true; do
+    safe_read "请选择，可多选，如 1 3 或 1,3（0 返回）: " input || return 1
+    input="${input//,/ }"
+    protocols=()
+    invalid=false
     for item in $input; do
-      case "$item" in
-        1) proto=mixed ;;
-        2) proto=vless_reality ;;
-        3) proto=vmess_ws ;;
-        4) proto=hysteria2 ;;
-        5) proto=tuic ;;
-        6) proto=anytls ;;
-        7) proto=trojan ;;
-        8) proto=shadowsocks ;;
-        9) proto=vmess_tcp ;;
-        10) proto=vmess_http ;;
-        *) warn "无效选择: $item"; return 1 ;;
-      esac
-      [[ " ${protocols[*]} " == *" $proto "* ]] || protocols+=("$proto")
+      if ! choice="$(menu_number "$item" "$((max+1))")"; then
+        invalid=true
+        break
+      fi
+      [[ "$choice" != 0 ]] || return 1
+      if ((choice == max+1)); then
+        protocols=("${AVAILABLE_PROTOCOLS[@]}")
+      else
+        proto="${AVAILABLE_PROTOCOLS[choice-1]}"
+        [[ " ${protocols[*]} " == *" $proto "* ]] || protocols+=("$proto")
+      fi
     done
-  fi
-  ((${#protocols[@]} > 0)) || return 1
-  # EOF must never read as consent to delete protocols.
-  safe_read "确认删除选中的 ${#protocols[@]} 个协议？[y/N]: " yn || return 1
-  [[ "$yn" =~ ^[Yy]$ ]] || return 1
-  for proto in "${protocols[@]}"; do
-    if protocol_exists "$proto"; then
-      delete_protocol_ufw_rules "$proto"
-      delete_protocol_state "$proto"
-      deleted=$((deleted + 1))
-    fi
+    if [[ "$invalid" == false ]] && ((${#protocols[@]})); then break; fi
+    warn "无效选择，请输入上方显示的编号。"
   done
-  rebuild_configs
-  restart_if_running
-  info "协议已删除 $deleted 个。"
-  return 0
+  printf '将删除以下 %s 个协议：\n' "${#protocols[@]}"
+  for proto in "${protocols[@]}"; do printf '  %s\n' "$(node_base_name "$proto")"; done
+  ask_yes_no "确认删除？" n || return 1
+  apply_state_change config delete_selected_protocols "${protocols[@]}" || return 1
+  restart_if_running || return 1
+  info "协议已删除 ${#protocols[@]} 个。"
+}
+
+delete_selected_protocols() {
+  local proto
+  for proto in "$@"; do delete_protocol_state "$proto" || return 1; done
 }
 
 os_name() {
@@ -4309,7 +4517,7 @@ sysctl_conflict_files() {
 
 write_sysctl_tune_file() {
   local cc="$1" qdisc="$2" bufmax="$3" backlog="$4"
-  cat >"$SYSCTL_TUNE_FILE" <<EOF
+  cat >"$SYSCTL_TUNE_FILE" <<EOF || return 1
 # sing-box-daimon network tuning. Managed file, safe to delete.
 net.core.default_qdisc = $qdisc
 net.ipv4.tcp_congestion_control = $cc
@@ -4521,13 +4729,13 @@ show_protocols() {
 }
 
 show_protocol_details() {
-  load_state_cache || true
+  is_alpine || load_state_cache || true
   if lite_mode; then
     title "NAT 轻量 VLESS Reality 节点链接如下："
   else
     title "单个协议链接和二维码如下："
   fi
-  if [[ ! -s "$STATE" ]]; then
+  if ! has_protocols; then
     printf "暂无协议。\n\n"
     return
   fi
@@ -4555,21 +4763,43 @@ view_protocols() {
 }
 
 run_manage() {
+  require_core_installed || { pause; return 0; }
+  local choice action label service failed
   local services=(sing-box)
   lite_mode || services+=(sing-box-sub)
   while true; do
     title "Sing-box运行管理"
     printf "1. 启动 Sing-box\n2. 停止 Sing-box\n3. 重启 Sing-box\n4. 查看状态\n5. 查看日志\n6. 开机自启\n7. 关闭开机自启\n8. 检查配置\n0. 返回上一界面\n"
-    case "$(ask_menu "请选择: " 8)" in
-      1) for service in "${services[@]}"; do managed_service_start "$service" || warn "$service 启动失败。"; done; info "已启动。"; pause ;;
-      2) for service in "${services[@]}"; do managed_service_stop "$service" || warn "$service 停止失败。"; done; info "已停止。"; pause ;;
-      3) for service in "${services[@]}"; do managed_service_restart "$service" || warn "$service 重启失败。"; done; info "已重启。"; pause ;;
-      4) managed_service_status sing-box || true; pause ;;
+    choice="$(ask_menu "请选择: " 8)"
+    case "$choice" in
+      1|2|3|6|7)
+        case "$choice" in
+          1) action=start; label=启动 ;;
+          2) action=stop; label=停止 ;;
+          3) action=restart; label=重启 ;;
+          6) action=enable_only; label=开启开机自启 ;;
+          7) action=disable_only; label=关闭开机自启 ;;
+        esac
+        failed=false
+        if [[ "$choice" == 1 || "$choice" == 3 ]]; then
+          "$BIN" check -C "$CONF" || { fail "配置检查失败，未启动或重启服务。"; pause; continue; }
+        fi
+        for service in "${services[@]}"; do
+          if ! "managed_service_$action" "$service"; then
+            fail "$service $label失败。"
+            failed=true
+          elif [[ "$choice" == 1 || "$choice" == 3 ]] && ! managed_service_active "$service"; then
+            fail "$service 未运行，请检查日志。"
+            failed=true
+          fi
+        done
+        [[ "$failed" == true ]] || info "服务$label成功。"
+        pause
+        ;;
+      4) for service in "${services[@]}"; do managed_service_status "$service" || true; done; pause ;;
       5) if is_alpine; then tail -n 80 "$LOG/sing-box.log" 2>/dev/null || true; else journalctl -u sing-box -n 80 --no-pager || true; fi; pause ;;
-      6) for service in "${services[@]}"; do managed_service_enable_only "$service" || warn "$service 开机自启设置失败。"; done; info "已开启开机自启。"; pause ;;
-      7) for service in "${services[@]}"; do managed_service_disable_only "$service" || warn "$service 关闭开机自启失败。"; done; info "已关闭开机自启。"; pause ;;
       8) "$BIN" check -C "$CONF" || true; pause ;;
-      0) return ;;
+      0) return 0 ;;
     esac
   done
 }
@@ -4580,7 +4810,7 @@ main_menu() {
     # Load once in this shell so the ~180 lookups below, which all run inside
     # command substitutions, inherit a populated array instead of each
     # re-sourcing the cache file.
-    load_state_cache || true
+    is_alpine || load_state_cache || true
     show_status_header
     show_protocols
     printf "\n"
@@ -4588,19 +4818,26 @@ main_menu() {
     menu_line 1 "更新脚本"
     menu_line 2 "删除脚本"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
-    menu_line 3 "标准安装 Sing-box"
+    is_alpine || menu_line 3 "标准安装 Sing-box"
     menu_line 13 "NAT 轻量安装：仅 Vless-reality"
     menu_line 4 "删除卸载 Sing-box"
     menu_line 5 "Sing-box运行管理"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
-    menu_line 6 "一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls"
+    if ! is_alpine && ! lite_mode; then
+      menu_line 6 "一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls"
+    fi
     menu_line 7 "添加协议"
     menu_line 8 "修改协议"
     menu_line 9 "删除协议"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
-    menu_line 10 "查看协议和综合订阅链接"
-    menu_line 11 "更改综合订阅配置"
-    menu_line 12 "一键放行所有缺失端口"
+    if is_alpine || lite_mode; then
+      menu_line 10 "查看 NAT 节点链接"
+      menu_line 11 "更改节点连接地址（IPv4/IPv6）"
+    else
+      menu_line 10 "查看协议和综合订阅链接"
+      menu_line 11 "更改综合订阅配置（含节点 IPv4/IPv6）"
+    fi
+    has_cmd ufw && menu_line 12 "一键放行所有缺失端口"
     menu_line 14 "设置节点名称前缀"
     menu_line 15 "系统工具：网络自适应优化"
     case "$(ask_menu "请选择: " 15)" in
@@ -4610,11 +4847,11 @@ main_menu() {
       4) uninstall_sing_box || true; pause ;;
       5) run_manage ;;
       6) add_all_protocols && restart_if_running; pause ;;
-      7) add_protocol_menu && pause ;;
-      8) change_protocol_config && pause ;;
-      9) delete_protocol_menu && pause ;;
+      7) add_protocol_menu || true; pause ;;
+      8) change_protocol_config || true; pause ;;
+      9) delete_protocol_menu || true; pause ;;
       10) view_protocols ;;
-      11) change_subscription_config && pause ;;
+      11) change_subscription_config || true; pause ;;
       12) allow_missing_ufw_ports || true; pause ;;
       13) install_nat_lite || true; pause ;;
       14) node_prefix_menu || true; pause ;;

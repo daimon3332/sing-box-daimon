@@ -13,6 +13,7 @@ READY=true
 mkdir -p "$ROOT"
 
 lite_dependencies_ready() { [[ "$READY" == "true" ]]; }
+system_id() { printf ubuntu; }
 has_cmd() { [[ "$1" == "apt-get" ]]; }
 apt-get() {
   local cache="" arg

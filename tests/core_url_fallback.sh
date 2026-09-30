@@ -10,12 +10,16 @@ eval "$(sed -n '/^core_download_url() {/,/^}/p' "$SB_PATH")"
 # aborted the install. Resolving the /releases/latest redirect has no such cap.
 
 API_OK=true
+API_MINIFIED=false
 REDIRECT='https://github.com/SagerNet/sing-box/releases/tag/v1.14.0'
 curl() {
   if [[ "$*" == *api.github.com* ]]; then
     [[ "$API_OK" == true ]] || return 22
-    printf '%s\n' '    "browser_download_url": "https://example.test/sing-box-1.14.0-linux-amd64.tar.gz"'
-    printf '%s\n' '    "browser_download_url": "https://example.test/sing-box-1.14.0-linux-amd64.tar.gz.asc"'
+    if [[ "$API_MINIFIED" == true ]]; then
+      printf '%s\n' '{"url":"https://api.github.com/repos/SagerNet/sing-box/releases/123","assets":[{"browser_download_url":"https://example.test/sing-box-1.14.0-linux-amd64.tar.gz"}]}'
+    else
+      printf '%s\n' '{"assets":[' '    {"browser_download_url":"https://example.test/sing-box-1.14.0-linux-amd64.tar.gz"},' '    {"browser_download_url":"https://example.test/sing-box-1.14.0-linux-amd64.tar.gz.asc"}' ']}'
+    fi
     return 0
   fi
   if [[ "$*" == *releases/latest* ]]; then
@@ -30,6 +34,11 @@ curl() {
 API_OK=true
 url="$(core_download_url amd64)"
 [[ "$url" == "https://example.test/sing-box-1.14.0-linux-amd64.tar.gz" ]]
+
+API_MINIFIED=true
+url="$(core_download_url amd64)"
+[[ "$url" == "https://example.test/sing-box-1.14.0-linux-amd64.tar.gz" ]]
+API_MINIFIED=false
 
 # API rate-limited: fall back to the redirect and build the asset URL.
 API_OK=false

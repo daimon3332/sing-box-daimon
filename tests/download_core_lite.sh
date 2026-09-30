@@ -26,7 +26,7 @@ sleep() { :; }
 
 curl() {
   if [[ "$*" == *api.github.com* ]]; then
-    printf '%s\n' '"browser_download_url": "https://example.test/sing-box-linux-amd64.tar.gz"'
+    printf '%s\n' '{"assets":[{"browser_download_url":"https://example.test/sing-box-linux-amd64.tar.gz"}]}'
     return
   fi
   printf '%s\n' "$*" >"$STREAM_MARKER"
