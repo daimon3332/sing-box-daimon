@@ -3286,7 +3286,8 @@ issue_subscription_cert() {
 }
 
 host_has_ipv6() {
-  [[ -s /proc/net/if_inet6 ]]
+  # procfs reports size 0, so -s is always false here; look for an entry.
+  grep -q . /proc/net/if_inet6 2>/dev/null
 }
 
 write_nginx_subscription_config() {
