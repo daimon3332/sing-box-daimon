@@ -288,7 +288,7 @@ https://域名/sub/token/mihomo   # Clash/Mihomo YAML
 https://域名/sub/token/raw      # 原始单行分享链接
 ```
 
-HTTP/IP 订阅始终保留；HTTPS 域名订阅只是额外增加。域名订阅只使用 HTTPS，不提供域名 HTTP 入口。
+HTTP/IP 订阅始终保留；HTTPS 域名订阅只是额外增加。Nginx 在内核支持 IPv6 时同时监听 IPv4 与 IPv6，纯 IPv6 VPS 申请证书时 acme.sh 自动使用 IPv6 监听。域名订阅只使用 HTTPS，不提供域名 HTTP 入口。
 
 HTTPS 域名订阅使用 Nginx + acme.sh，不使用 Caddy。使用前需要提前把域名 A/AAAA 记录解析到 VPS IP。设置域名时脚本会自动安装或复用 Nginx、安装或复用 acme.sh、申请 Let's Encrypt 证书、写入 Nginx 反代配置、配置证书自动续期。证书申请失败时会提示失败，不继续写入 Nginx 订阅配置。删除 HTTPS 域名时只删除本脚本托管的 Nginx 配置和该域名证书，不卸载 Nginx。
 
@@ -344,6 +344,7 @@ http://IP:2096/sub/token/mihomo
 - SOCKS5 分享链接使用明文 `用户名:密码`
 - Reality SNI 随机使用 `www.bing.com`、`www.amazon.com`、`www.apple.com`，并支持自定义
 - Hysteria2 支持 UDP 跳跃端口转发；TUIC 不再提供半实现跳跃端口入口
+- 跳跃端口规则在每次启动 sing-box 前按 `state.json` 自动重建，重启 VPS 后无需安装 iptables-persistent
 - Hysteria2/TUIC 默认使用自签证书，客户端订阅默认跳过证书验证
 - 自动检测 TCP/UDP 端口占用，避免配置端口重复
 - 综合订阅支持修改端口、指定 token、回车随机重生成 token、设置或删除 HTTPS 订阅域名
@@ -354,7 +355,7 @@ http://IP:2096/sub/token/mihomo
 - 每次生成订阅会清理非当前 token 的订阅文件，避免旧 token 内容留在磁盘上
 - 状态读取使用进程内缓存，菜单渲染只加载一次；缓存文件仅接受预期格式，损坏或旧格式会重建而不会被执行
 - 内核下载在 GitHub API 触发限流时自动改用 `releases/latest` 跳转解析，不再因每小时 60 次限制而安装失败
-- 跳跃端口范围如果包含其他协议的 UDP 端口会被拒绝，避免这些节点收不到流量
+- 跳跃端口范围如果包含其他协议的 UDP 端口会被拒绝，避免这些节点收不到流量；之后新增或修改端口也会自动避开已设置的跳跃范围
 - IPv6-only VPS 的节点会自动使用 `[IPv6]` 形式生成 URI；双栈 VPS 可按协议选择 IPv4 或 IPv6
 - UFW active 时，安装、添加、更改协议后自动按 TCP/UDP 放行对应端口和订阅端口
 - UFW active 时，会维护脚本托管规则，端口变更后自动删除旧规则并放行新规则

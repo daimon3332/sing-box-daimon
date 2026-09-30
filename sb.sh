@@ -2,7 +2,7 @@
 set -Eeuo pipefail
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.10.0"
+SCRIPT_VERSION="1.10.1"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
 CONF="$ROOT/conf"
@@ -185,13 +185,11 @@ valid_ip_address() {
   local address="$1" version="$2"
   if is_alpine || ! has_cmd python3; then
     if [[ "$version" == "4" ]]; then
-      local a b c d extra
-      IFS=. read -r a b c d extra <<<"$address"
-      [[ -z "${extra:-}" ]] || return 1
-      for a in "$a" "$b" "$c" "$d"; do
-        [[ "$a" =~ ^[0-9]+$ ]] && ((10#$a <= 255)) || return 1
-      done
-      return 0
+      # Four dot-separated octets, no trailing dot, no leading zeros; matches
+      # what Python's ipaddress accepts on the non-Alpine path.
+      local octet='(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])'
+      [[ "$address" =~ ^$octet\.$octet\.$octet\.$octet$ ]]
+      return
     fi
     [[ "$address" == *:* && "$address" =~ ^[0-9A-Fa-f:]+$ && "$address" != *:::* ]] || return 1
     local rest="$address" part count=0 compressed=false
@@ -351,8 +349,11 @@ invalidate_state_cache() {
 refresh_state_cache_file() {
   local state_cache_file="$1" tmp
   [[ ! -s "$state_cache_file" || "$STATE" -nt "$state_cache_file" ]] || return 0
-  tmp="$(mktemp "$ROOT/.state-cache.XXXXXX")" || return 1
-  if ! python3 - "$STATE" <<'PY' >"$tmp"
+  # No state yet (fresh host, after uninstall) or no python3 (Alpine): there is
+  # nothing to cache, and trying printed a traceback on every menu render.
+  [[ -s "$STATE" ]] && has_cmd python3 || return 1
+  tmp="$(mktemp "$ROOT/.state-cache.XXXXXX" 2>/dev/null)" || return 1
+  if ! python3 - "$STATE" <<'PY' >"$tmp" 2>/dev/null
 import json, shlex, sys
 data = json.load(open(sys.argv[1], encoding="utf-8"))
 def emit(value, path=()):
@@ -560,8 +561,10 @@ set_state_value() {
   ensure_state
   if is_alpine; then
     local tmp type=string
-    [[ "$key" == "sub_port" || "$key" == "version.checked" ]] && [[ "$value" =~ ^[0-9]+$ ]] && type=number
-    [[ "$value" == "true" || "$value" == "false" ]] && type=boolean
+    [[ "$key" == "sub_port" ]] && [[ "$value" =~ ^[0-9]+$ ]] && type=number
+    # Only known boolean keys are coerced; a token or prefix spelled "true"
+    # must stay a string or links and names stop matching.
+    [[ "$key" == "sub_tls" ]] && [[ "$value" == "true" || "$value" == "false" ]] && type=boolean
     tmp="$(mktemp "$ROOT/.state.XXXXXX")"
     jq --arg key "$key" --arg value "$value" --arg type "$type" '
       ($key | split(".")) as $path |
@@ -580,7 +583,7 @@ for part in key[:-1]:
   cur = cur.setdefault(part, {})
 if key[-1] in {"sub_port"} and value.isdigit():
   cur[key[-1]] = int(value)
-elif value in {"true", "false"}:
+elif key[-1] in {"sub_tls"} and value in {"true", "false"}:
   cur[key[-1]] = value == "true"
 else:
   cur[key[-1]] = value
@@ -601,50 +604,52 @@ fetch_latest_script() {
     || curl -fsSL --max-time 8 -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$url" 2>/dev/null
 }
 
+# The version check runs in the background while the menu may be writing
+# state.json. It used to read-modify-write state.json through the same
+# state.json.tmp path, so the two could lose each other's update or interleave
+# into a corrupt file; it also created state.json before anything was
+# installed. Keep it in its own cache file instead.
+version_cache_file() {
+  printf '%s/version' "$(status_cache_dir)"
+}
+
 refresh_version_cache() {
-  local latest now
+  local latest now file tmp old_latest=""
   latest="$(fetch_latest_script | sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' | head -n1 || true)"
   now="$(date +%s)"
-  ensure_state
-  if is_alpine; then
-    [[ -z "$latest" ]] || set_state_value version.latest "$latest"
-    set_state_value version.checked "$now"
-    return
+  file="$(version_cache_file)"
+  mkdir -p "${file%/*}" 2>/dev/null || return 0
+  [[ -s "$file" ]] && read -r old_latest _ <"$file" || true
+  tmp="$(mktemp "$file.XXXXXX" 2>/dev/null)" || return 0
+  printf '%s %s\n' "${latest:-${old_latest:--}}" "$now" >"$tmp" && mv -f "$tmp" "$file" || rm -f "$tmp"
+  return 0
+}
+
+# Take a background-job lock directory. A job killed mid-run leaves its lock
+# behind, which used to disable that refresh until the next reboot; treat a
+# lock older than two minutes as abandoned.
+acquire_async_lock() {
+  local lock="$1"
+  if [[ -d "$lock" ]] && [[ -n "$(find "$lock" -maxdepth 0 -mmin +2 2>/dev/null)" ]]; then
+    rmdir "$lock" 2>/dev/null || true
   fi
-  python3 - "$STATE" "$latest" "$now" <<'PY' >/dev/null 2>&1 || true
-import json, os, sys
-path, latest, now = sys.argv[1], sys.argv[2], int(sys.argv[3])
-try:
-  data = json.load(open(path, encoding="utf-8"))
-except Exception:
-  raise SystemExit
-version = data.setdefault("version", {})
-if latest:
-  version["latest"] = latest
-version["checked"] = now
-tmp = path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-  json.dump(data, f, indent=2, ensure_ascii=False)
-  f.write("\n")
-  f.flush()
-  os.fsync(f.fileno())
-os.replace(tmp, path)
-PY
-  invalidate_state_cache
+  mkdir "$lock" 2>/dev/null
 }
 
 refresh_version_cache_async() {
-  is_alpine && ! has_cmd jq && return 0
-  local lock="${TMPDIR:-/tmp}/sing-box-daimon-version-refresh-${EUID:-$(id -u)}"
-  [[ -e "$lock" ]] && return 0
-  mkdir "$lock" 2>/dev/null || return 0
+  local dir lock
+  dir="$(status_cache_dir)"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  lock="$dir/version.lock"
+  acquire_async_lock "$lock" || return 0
   ( refresh_version_cache; rmdir "$lock" 2>/dev/null || true ) >/dev/null 2>&1 &
 }
 
 version_status() {
-  local latest checked now age status
-  latest="$(state_value version.latest "")"
-  checked="$(state_value version.checked 0)"
+  local latest="" checked=0 now age status file
+  file="$(version_cache_file)"
+  [[ -s "$file" ]] && read -r latest checked <"$file" || true
+  [[ "$latest" == "-" ]] && latest=""
   now="$(date +%s)"
   [[ "$checked" =~ ^[0-9]+$ ]] || checked=0
   age=$((now - checked))
@@ -674,7 +679,7 @@ set_protocol() {
         ($pair | index("=")) as $split |
         ($pair[0:$split]) as $key |
         ($pair[$split + 1:]) as $raw |
-        ($raw | if ($key | test("port$") or $key == "alter_id") then tonumber elif . == "true" then true elif . == "false" then false else . end) as $value |
+        ($raw | if ($key | test("port$") or $key == "alter_id") then tonumber elif (($key == "enabled" or $key == "tls") and (. == "true" or . == "false")) then . == "true" else . end) as $value |
         .protocols[$proto][$key] = $value
       )
     ' "$@" <"$STATE" >"$tmp" && mv -f "$tmp" "$STATE" || { rm -f "$tmp"; return 1; }
@@ -690,7 +695,7 @@ for pair in pairs:
   key, value = pair.split("=", 1)
   if key.endswith("port") or key in {"alter_id"}:
     item[key] = int(value)
-  elif value in {"true", "false"}:
+  elif key in {"enabled", "tls"} and value in {"true", "false"}:
     item[key] = value == "true"
   else:
     item[key] = value
@@ -755,6 +760,20 @@ apply_hopping_rules() {
   fi
 }
 
+# NAT rules live only in the kernel. Unless iptables-persistent happens to be
+# installed, a reboot drops the Hysteria2 hopping REDIRECT while the node keeps
+# advertising the range. sing-box.service runs this before every start so the
+# rules always match state.json.
+apply_saved_hopping_rules() {
+  if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
+    apply_hopping_rules hysteria2 "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")" "$(proto_value hysteria2 port)"
+  else
+    delete_hopping_rules hysteria2
+  fi
+  delete_hopping_rules tuic
+  return 0
+}
+
 save_firewall_rules() {
   if has_cmd netfilter-persistent; then
     netfilter-persistent save >/dev/null 2>&1 || true
@@ -787,7 +806,7 @@ protocol_ufw_rules() {
   [[ "$(proto_value "$proto" enabled false)" == "true" ]] || return 0
   port="$(proto_value "$proto" port "")"
   case "$proto" in
-    mixed)
+    mixed|shadowsocks)
       [[ -n "$port" ]] && printf '%s/tcp\n%s/udp\n' "$port" "$port"
       ;;
     hysteria2|tuic)
@@ -968,7 +987,12 @@ allow_missing_ufw_ports() {
 # traffic. Report the collisions instead of silently breaking those nodes.
 hopping_range_conflicts() {
   local owner="$1" start="$2" end="$3" proto port
-  for proto in mixed hysteria2 tuic; do
+  # Callers pass the display label ("Hysteria-2"); without normalising it the
+  # protocol's own port was reported as a conflict with itself.
+  owner="${owner,,}"
+  owner="${owner//-/}"
+  [[ "$owner" == tuicv5 ]] && owner=tuic
+  for proto in mixed hysteria2 tuic shadowsocks; do
     [[ "$proto" == "$owner" ]] && continue
     [[ "$(proto_value "$proto" enabled false)" == "true" ]] || continue
     port="$(proto_value "$proto" port "")"
@@ -1011,9 +1035,26 @@ ask_hopping() {
 
 tcp_udp_used() {
   local port="$1"
-  ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . && return 0
-  ss -H -lun "sport = :$port" 2>/dev/null | grep -q . && return 0
-  return 1
+  if has_cmd ss; then
+    ss -H -ltn "sport = :$port" 2>/dev/null | grep -q . && return 0
+    ss -H -lun "sport = :$port" 2>/dev/null | grep -q . && return 0
+    return 1
+  fi
+  # Alpine's BusyBox ships netstat but not ss; without this every port looked free.
+  has_cmd netstat || return 1
+  netstat -lntu 2>/dev/null | awk -v p="$port" '$4 ~ ("[:.]" p "$") { found = 1 } END { exit found ? 0 : 1 }'
+}
+
+# The Hysteria2 hopping rule REDIRECTs its whole UDP range, so a port inside it
+# never receives its own UDP traffic. The range is checked once when it is set;
+# this keeps ports picked or entered later from landing inside it.
+hop_range_used() {
+  local port="$1" start end
+  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || return 1
+  start="$(proto_value hysteria2 hop_start "")"
+  end="$(proto_value hysteria2 hop_end "")"
+  [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ && "$port" =~ ^[0-9]+$ ]] || return 1
+  (( port >= start && port <= end ))
 }
 
 config_port_used() {
@@ -1075,13 +1116,24 @@ PY
 port_used() {
   local port="$1" exclude="${2:-}"
   [[ -n "$exclude" && "$port" == "$exclude" ]] && return 1
-  tcp_udp_used "$port" || config_port_used "$port" || state_port_used "$port"
+  hop_range_used "$port" || tcp_udp_used "$port" || config_port_used "$port" || state_port_used "$port"
 }
 
 next_free_port() {
-  local port="$1" exclude="${2:-}"
+  local port="$1" exclude="${2:-}" hop_start hop_end
+  hop_start="$(proto_value hysteria2 hop_start "")"
+  hop_end="$(proto_value hysteria2 hop_end "")"
   while port_used "$port" "$exclude"; do
-    port=$((port + 1))
+    # Skip a hop range in one step; probing it port by port costs several
+    # python runs each, which is minutes for a range like 20000:50000.
+    if [[ "$port" != "$exclude" && "$hop_start" =~ ^[0-9]+$ && "$hop_end" =~ ^[0-9]+$ ]] &&
+       (( port >= hop_start && port <= hop_end )) && hop_range_used "$port"; then
+      port=$((hop_end + 1))
+    else
+      port=$((port + 1))
+    fi
+    # A hop range reaching 65535 would otherwise walk past the valid range.
+    (( port <= 65535 )) || port=10000
   done
   printf '%s' "$port"
 }
@@ -1569,12 +1621,7 @@ rebuild_configs() {
   if [[ "$(proto_value vmess_http enabled false)" == "true" ]]; then
     write_vmess_http_config "$(proto_value vmess_http port)" "$(proto_value vmess_http uuid)" "$(proto_value vmess_http path /vmess-http)" "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")"
   fi
-  if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
-    apply_hopping_rules hysteria2 "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")" "$(proto_value hysteria2 port)"
-  else
-    delete_hopping_rules hysteria2
-  fi
-  delete_hopping_rules tuic
+  apply_saved_hopping_rules
   sync_ufw_ports
   save_firewall_rules
   generate_subscription
@@ -1615,11 +1662,10 @@ refresh_status_network_async() {
   dir="$(status_cache_dir)"
   mkdir -p "$dir" 2>/dev/null || return 0
   lock="$dir/network.lock"
-  [[ -e "$lock" ]] && return 0
   if status_cache_fresh "$dir/ipv4" && status_cache_fresh "$dir/ipv6"; then
     return 0
   fi
-  mkdir "$lock" 2>/dev/null || return 0
+  acquire_async_lock "$lock" || return 0
   (
     local tmp4="$dir/ipv4.tmp" tmp6="$dir/ipv6.tmp"
     local pid4 pid6 value
@@ -2504,17 +2550,47 @@ EOF
   chmod +x "$SUB_SERVER"
 }
 
+# A downloaded script is installed only when it is complete and parses: a
+# truncated download or an HTML error page must never replace the manager.
+valid_script_file() {
+  local file="$1"
+  [[ -s "$file" ]] && bash -n "$file" 2>/dev/null &&
+    grep -q '^SCRIPT_VERSION="[^"]\+"' "$file"
+}
+
 write_managed_script() {
   local src tmp
   src="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
-  if [[ -r "$src" && "$src" != "$SCRIPT" ]] && head -n 3 "$src" 2>/dev/null | grep -q "bash"; then
+  # Running from the installed copy (sb / sing-box shortcuts): it is already in
+  # place. This used to fall through to a download, silently replacing the
+  # running version with whatever was on GitHub.
+  if [[ "$src" == "$SCRIPT" && -s "$SCRIPT" ]]; then
+    chmod 0755 "$SCRIPT"
+    return 0
+  fi
+  if [[ -r "$src" ]] && valid_script_file "$src"; then
     install -m 0755 "$src" "$SCRIPT"
-  else
-    tmp="$ROOT/sb.sh.tmp"
-    curl -fsSL "$SCRIPT_URL" -o "$tmp"
+    return
+  fi
+  tmp="$(mktemp "$ROOT/.sb.sh.XXXXXX")" || return 1
+  if curl -fsSL --max-time 60 "$SCRIPT_URL" -o "$tmp" && valid_script_file "$tmp"; then
     install -m 0755 "$tmp" "$SCRIPT"
     rm -f "$tmp"
+    return 0
   fi
+  rm -f "$tmp"
+  fail "管理脚本下载失败或内容不完整，未覆盖现有脚本。"
+  return 1
+}
+
+# Point a shortcut at the managed script only when it is free or already ours.
+# Something else at /usr/local/bin/sing-box may be a real sing-box binary.
+link_shortcut_if_managed() {
+  local link="$1"
+  if [[ -e "$link" || -L "$link" ]] && [[ "$(readlink -f "$link" 2>/dev/null || true)" != "$SCRIPT" ]]; then
+    return 0
+  fi
+  ln -sf "$SCRIPT" "$link"
 }
 
 managed_service_exists() {
@@ -2608,6 +2684,7 @@ After=network-online.target nss-lookup.target
 Wants=network-online.target
 
 [Service]
+ExecStartPre=-/bin/bash $SCRIPT --apply-hopping
 ExecStart=$BIN run -C $CONF
 Restart=always
 RestartSec=3
@@ -2977,7 +3054,13 @@ issue_subscription_cert() {
     return 0
   fi
   stop_http_services_for_acme || { restart_nginx_after_acme; return 1; }
-  if ! "$acme" --issue -d "$domain" --standalone --server letsencrypt --force; then
+  # acme.sh standalone listens on IPv4 only unless told otherwise, so an
+  # IPv6-only host (AAAA record only) could never pass the HTTP-01 challenge.
+  local listen_opts=()
+  if host_has_ipv6 && [[ -z "$(public_ipv4)" ]]; then
+    listen_opts=(--listen-v6)
+  fi
+  if ! "$acme" --issue -d "$domain" --standalone "${listen_opts[@]}" --server letsencrypt --force; then
     restart_nginx_after_acme
     return 1
   fi
@@ -2994,19 +3077,31 @@ issue_subscription_cert() {
   subscription_cert_exists "$domain"
 }
 
+host_has_ipv6() {
+  [[ -s /proc/net/if_inet6 ]]
+}
+
 write_nginx_subscription_config() {
-  local domain="$1" port="$2" dir
+  local domain="$1" port="$2" dir listen80_v6="" listen443_v6=""
   dir="$(subscription_cert_dir "$domain")"
   mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+  # IPv4-only listeners left https://domain/sub/... unreachable over IPv6.
+  # Only add [::] when the kernel has IPv6, or nginx fails to bind.
+  if host_has_ipv6; then
+    listen80_v6="
+    listen [::]:80;"
+    listen443_v6="
+    listen [::]:443 ssl http2;"
+  fi
   cat >"$NGINX_SUB_CONF" <<EOF
 server {
-    listen 80;
+    listen 80;$listen80_v6
     server_name $domain;
     return 301 https://\$host\$request_uri;
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl http2;$listen443_v6
     server_name $domain;
 
     ssl_certificate $dir/fullchain.pem;
@@ -3324,7 +3419,7 @@ add_mixed() {
   port="$(ask_port "Mixed" 30000)"
   username="$(ask_text "Mixed 用户名" "daimon")"
   password="$(ask_text "Mixed 密码" "daimon")"
-  set_selected_protocol mixed "port=$port" "username=$username" "password=$password"
+  set_selected_protocol mixed "port=$port" "username=$username" "password=$password" || return 1
   rebuild_configs
 }
 
@@ -3343,7 +3438,7 @@ add_vless_reality() {
     fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
     return 1
   fi
-  set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key"
+  set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key" || return 1
   rebuild_configs
 }
 
@@ -3353,7 +3448,7 @@ add_vmess_ws() {
   port="$(ask_port "Vmess-ws" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-ws UUID" "$(rand_uuid)")"
   ask_yes_no "是否开启 VMess-WS TLS？" n && tls=true || tls=false
-  set_selected_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls"
+  set_selected_protocol vmess_ws "port=$port" "uuid=$uuid" "tls=$tls" || return 1
   rebuild_configs
 }
 
@@ -3364,7 +3459,7 @@ add_hysteria2() {
   password="$(ask_text "Hysteria-2 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
   IFS=$'\t' read -r hop_start hop_end < <(ask_hopping "Hysteria-2")
-  set_selected_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end"
+  set_selected_protocol hysteria2 "port=$port" "password=$password" "sni=$sni" "hop_start=$hop_start" "hop_end=$hop_end" || return 1
   rebuild_configs
 }
 
@@ -3375,7 +3470,7 @@ add_tuic() {
   uuid="$(ask_text "Tuic-v5 UUID" "$(rand_uuid)")"
   password="$(ask_text "Tuic-v5 密码" "$uuid")"
   sni="$(pick_sni "$(random_sni)")"
-  set_selected_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end="
+  set_selected_protocol tuic "port=$port" "uuid=$uuid" "password=$password" "sni=$sni" "hop_start=" "hop_end=" || return 1
   rebuild_configs
 }
 
@@ -3385,7 +3480,7 @@ add_anytls() {
   port="$(ask_port "Anytls" "$(random_free_port)")"
   password="$(ask_text "Anytls 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
-  set_selected_protocol anytls "port=$port" "password=$password" "sni=$sni"
+  set_selected_protocol anytls "port=$port" "password=$password" "sni=$sni" || return 1
   rebuild_configs
 }
 
@@ -3395,7 +3490,7 @@ add_trojan() {
   port="$(ask_port "Trojan" "$(random_free_port)")"
   password="$(ask_text "Trojan 密码" "$(rand_uuid)")"
   sni="$(pick_sni "$(random_sni)")"
-  set_selected_protocol trojan "port=$port" "password=$password" "sni=$sni"
+  set_selected_protocol trojan "port=$port" "password=$password" "sni=$sni" || return 1
   rebuild_configs
 }
 
@@ -3405,7 +3500,7 @@ add_shadowsocks() {
   port="$(ask_port "Shadowsocks" "$(random_free_port)")"
   password="$(ask_text "Shadowsocks 密码" "$(rand_uuid)")"
   method="$(ask_text "Shadowsocks 加密方式" "aes-128-gcm")"
-  set_selected_protocol shadowsocks "port=$port" "password=$password" "method=$method"
+  set_selected_protocol shadowsocks "port=$port" "password=$password" "method=$method" || return 1
   rebuild_configs
 }
 
@@ -3414,7 +3509,7 @@ add_vmess_tcp() {
   choose_node_ip_version "Vmess-tcp" || return 1
   port="$(ask_port "Vmess-tcp" "$(random_free_port)")"
   uuid="$(ask_text "Vmess-tcp UUID" "$(rand_uuid)")"
-  set_selected_protocol vmess_tcp "port=$port" "uuid=$uuid"
+  set_selected_protocol vmess_tcp "port=$port" "uuid=$uuid" || return 1
   rebuild_configs
 }
 
@@ -3426,7 +3521,7 @@ add_vmess_http() {
   host="$(pick_sni "$(random_sni)")"
   path="$(ask_text "Vmess-http 路径" "/vmess-http")"
   [[ "$path" == /* ]] || path="/$path"
-  set_selected_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path"
+  set_selected_protocol vmess_http "port=$port" "uuid=$uuid" "host=$host" "path=$path" || return 1
   rebuild_configs
 }
 
@@ -3446,24 +3541,24 @@ add_all_protocols() {
     fi
   done
   [[ "$needs_ip" == "false" ]] || choose_node_ip_version "一键添加协议" || return 1
-  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon"
+  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon" || return 1
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] || {
     local keys private_key public_key
     keys="$(reality_keypair || true)"
     private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
     public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
     [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"; return 1; }
-    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key"
+    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key" || return 1
   }
-  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_selected_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false"
-  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_selected_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end="
+  [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_selected_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false" || return 1
+  [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_selected_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end=" || return 1
   if [[ "$(proto_value tuic enabled false)" != "true" ]]; then
     local tuic_uuid
     tuic_uuid="$(rand_uuid)"
-    set_selected_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end="
+    set_selected_protocol tuic "port=$(random_free_port)" "uuid=$tuic_uuid" "password=$tuic_uuid" "sni=$(random_sni)" "hop_start=" "hop_end=" || return 1
   fi
-  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_selected_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)"
-  rebuild_configs
+  [[ "$(proto_value anytls enabled false)" == "true" ]] || set_selected_protocol anytls "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" || return 1
+  rebuild_configs || return 1
   info "一键协议已生成。"
   show_protocol_details
 }
@@ -3474,17 +3569,26 @@ install_sing_box() {
     fail "Alpine 仅支持菜单 13 的 NAT 轻量 VLESS Reality 安装。"
     return 1
   fi
-  install_dependencies standard
+  # Called as "install_sing_box || true", where bash disables set -e inside the
+  # function; each step must be checked or a failed download installs anyway.
+  install_dependencies standard || return 1
   ensure_dirs
-  ensure_state
-  set_state_value install_mode standard
-  download_core standard
-  ensure_cert
+  ensure_state || return 1
+  set_state_value install_mode standard || return 1
+  download_core standard || return 1
+  ensure_cert || { fail "自签证书生成失败。"; return 1; }
   write_base_configs
   write_sub_server
-  write_services standard
-  install_shortcuts
-  sync_ufw_ports
+  write_services standard || return 1
+  install_shortcuts || warn "快捷命令安装失败，可继续使用 $SCRIPT。"
+  if has_protocols; then
+    # Upgrading from NAT lite keeps its VLESS node, but lite mode never wrote
+    # the v2rayN/Clash files, so the subscription answered 404 until the next
+    # protocol change. Rebuilding also syncs UFW and hopping rules.
+    rebuild_configs || warn "已有协议的订阅刷新失败，请稍后在菜单中修改协议或更新脚本重试。"
+  else
+    sync_ufw_ports
+  fi
   systemctl enable sing-box sing-box-sub >/dev/null 2>&1 || true
   if systemctl restart sing-box sing-box-sub >/dev/null 2>&1 &&
     systemctl is-active --quiet sing-box &&
@@ -3503,18 +3607,18 @@ lite_state_is_fresh() {
 
 install_nat_lite() {
   need_root
-  install_dependencies lite
-  ensure_state
+  install_dependencies lite || return 1
+  ensure_state || return 1
   lite_state_is_fresh || {
     fail "NAT 轻量安装只接受尚未添加协议的状态，请先使用标准模式或清理现有协议。"
     return 1
   }
   ensure_dirs
   download_core lite || return 1
-  set_state_value install_mode lite
+  set_state_value install_mode lite || return 1
   write_base_configs
-  write_services lite
-  install_shortcuts
+  write_services lite || return 1
+  install_shortcuts || warn "快捷命令安装失败，可继续使用 $SCRIPT。"
   sync_ufw_ports
   managed_service_enable sing-box || true
   maybe_set_node_prefix
@@ -3533,7 +3637,7 @@ install_nat_lite() {
     "sni=$(random_sni)" \
     "short_id=$(rand_hex 8)" \
     "private_key=$private_key" \
-    "public_key=$public_key"
+    "public_key=$public_key" || return 1
   rebuild_configs || return 1
   if managed_service_restart sing-box >/dev/null 2>&1 && managed_service_active sing-box; then
     info "NAT 轻量 VLESS Reality 已安装并运行。外部端口请在 NAT 页面映射为同一端口。"
@@ -3584,7 +3688,8 @@ uninstall_sing_box() {
   rm -f "$SERVICE" "$SUB_SERVICE"
   is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
   rm -rf "$ROOT/bin" "$CONF" "$CERT" "$SUB" "$LOG"
-  rm -f "$STATE" "$STATE.tmp" "$SUB_SERVER"
+  rm -f "$STATE" "$STATE.tmp" "$SUB_SERVER" "$UFW_RULES"
+  invalidate_state_cache
   remove_alpine_managed_packages false
   ensure_dirs
   info "Sing-box 和所有协议已卸载，管理脚本已保留。"
@@ -3623,16 +3728,16 @@ update_script() {
     fail "脚本更新失败：下载失败。"
     return 1
   fi
-  if ! bash -n "$tmp"; then
+  if ! valid_script_file "$tmp"; then
     rm -f "$tmp"
-    fail "脚本更新失败：新脚本语法检查未通过。"
+    fail "脚本更新失败：新脚本为空、不完整或语法检查未通过。"
     return 1
   fi
   latest="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
   install -m 0755 "$tmp" "$SCRIPT"
   rm -f "$tmp"
   ln -sf "$SCRIPT" /usr/local/bin/sb
-  ln -sf "$SCRIPT" /usr/local/bin/sing-box
+  link_shortcut_if_managed /usr/local/bin/sing-box
   if ! "$SCRIPT" --refresh-installed; then
     fail "脚本已更新，但已有安装状态刷新失败，请重新执行更新或检查服务日志。"
     return 1
@@ -3725,18 +3830,25 @@ add_protocol_menu() {
   choice="$(ask_menu "请选择: " 10)"
   [[ "$choice" == "0" ]] && return 1
   maybe_set_node_prefix
+  # Menu handlers run under "&&", where bash ignores set -e inside functions, so
+  # a failed add used to fall through and still print "协议已添加".
+  local rc=0
   case "$choice" in
-    1) add_mixed ;;
-    2) add_vless_reality ;;
-    3) add_vmess_ws ;;
-    4) add_hysteria2 ;;
-    5) add_tuic ;;
-    6) add_anytls ;;
-    7) add_trojan ;;
-    8) add_shadowsocks ;;
-    9) add_vmess_tcp ;;
-    10) add_vmess_http ;;
+    1) add_mixed || rc=$? ;;
+    2) add_vless_reality || rc=$? ;;
+    3) add_vmess_ws || rc=$? ;;
+    4) add_hysteria2 || rc=$? ;;
+    5) add_tuic || rc=$? ;;
+    6) add_anytls || rc=$? ;;
+    7) add_trojan || rc=$? ;;
+    8) add_shadowsocks || rc=$? ;;
+    9) add_vmess_tcp || rc=$? ;;
+    10) add_vmess_http || rc=$? ;;
   esac
+  if (( rc != 0 )); then
+    fail "协议添加失败。"
+    return 0
+  fi
   restart_if_running
   info "协议已添加。"
   show_protocol_details
@@ -4106,8 +4218,7 @@ refresh_region_async() {
   mkdir -p "$dir" 2>/dev/null || return 0
   status_cache_fresh "$cache" && return 0
   lock="$dir/region.lock"
-  [[ -e "$lock" ]] && return 0
-  mkdir "$lock" 2>/dev/null || return 0
+  acquire_async_lock "$lock" || return 0
   (
     local tmp="$cache.tmp"
     fetch_region >"$tmp" 2>/dev/null || true
@@ -4323,6 +4434,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   rm -f "$ROOT/.state-cache.sh" 2>/dev/null || true
   case "${1:-}" in
     --refresh-installed) refresh_installed ;;
+    --apply-hopping) apply_saved_hopping_rules ;;
     *)
       if legacy_subscription_needs_refresh; then
         refresh_installed || warn "检测到旧版订阅格式，但自动刷新失败，请在菜单中重新执行更新。"
