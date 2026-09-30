@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.11.1"
+SCRIPT_VERSION="1.11.2"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -76,6 +76,17 @@ safe_read() {
   else
     read -r -p "$1" "$2" || return 1
   fi
+}
+
+# Leaving a submenu with 0 is not an action; skip the extra "press Enter".
+menu_cancel() {
+  MENU_CANCELLED=true
+  return 1
+}
+
+menu_pause() {
+  [[ "${MENU_CANCELLED:-false}" == true ]] || pause
+  MENU_CANCELLED=false
 }
 
 pause() {
@@ -547,9 +558,10 @@ maybe_set_node_prefix() {
   while true; do
     # Prefixes are optional, so an unanswerable prompt just leaves it unset
     # rather than aborting the install midway.
-    safe_read "请输入节点名称前缀: " value || return 0
+    safe_read "请输入节点名称前缀（留空跳过）: " value || return 0
     value="${value#"${value%%[![:space:]]*}"}"
     value="${value%"${value##*[![:space:]]}"}"
+    [[ -n "$value" ]] || return 0
     if set_node_prefix "$value"; then
       info "节点名称前缀已设置为: $value"
       return 0
@@ -583,7 +595,7 @@ node_prefix_menu() {
       apply_state_change subscription clear_node_prefix || return 1
       info "节点名称前缀已删除，订阅已更新。"
       ;;
-    0) return 1 ;;
+    0) menu_cancel ;;
   esac
 }
 
@@ -1058,7 +1070,7 @@ ask_hopping() {
   esac
   while true; do
     safe_read "请输入跳跃端口范围，格式 48000:50000${current_start:+ [$current_start:$current_end]}（0 返回）: " range || return 1
-    [[ "$range" != 0 ]] || return 1
+    [[ "$range" != 0 ]] || menu_cancel
     range="${range:-${current_start:+$current_start:$current_end}}"
     if valid_port_range "$range"; then
       range="${range/-/:}"
@@ -1258,7 +1270,7 @@ select_existing_protocol() {
   fi
   printf '0. 返回\n'
   choice="$(ask_menu "请选择协议: " "$max")"
-  [[ "$choice" != 0 ]] || return 1
+  [[ "$choice" != 0 ]] || menu_cancel
   if [[ "$all" == true && "$choice" == "$max" ]]; then
     SELECTED_PROTOCOL=all
   else
@@ -1267,12 +1279,13 @@ select_existing_protocol() {
 }
 
 ask_menu() {
-  local prompt="$1" max="$2" input
+  local prompt="$1" max="$2" default="${3:-}" input
   while true; do
     # On EOF (piped input exhausted, or Ctrl-D) fall back to 0, the "return" /
     # "exit" choice every caller has. Retrying instead spun forever, since a
     # closed stdin never yields a valid number.
     safe_read "$prompt" input || { printf '0'; return; }
+    input="${input:-$default}"
     if input="$(menu_number "$input" "$max")"; then
       printf '%s' "$input"
       return 0
@@ -1287,9 +1300,16 @@ menu_line() {
 }
 
 pick_sni() {
-  local current="${1:-}" choice custom
-  printf "1. %s\n2. %s\n3. %s\n4. 自定义\n0. 返回\n" "${SNI_OPTIONS[@]}" >&2
-  choice="$(ask_menu "请选择 SNI [1-4]: " 4)"
+  local current="${1:-}" choice custom default=4 i
+  for i in 0 1 2; do
+    [[ "$current" != "${SNI_OPTIONS[i]}" ]] || default=$((i + 1))
+  done
+  [[ -n "$current" ]] || default=1
+  for i in 0 1 2; do
+    printf '%s. %s%s\n' "$((i + 1))" "${SNI_OPTIONS[i]}" "$( ((default == i + 1)) && printf '  (默认)')" >&2
+  done
+  printf '4. 自定义%s\n0. 返回\n' "$( ((default == 4)) && printf '  (默认: %s)' "$current")" >&2
+  choice="$(ask_menu "请选择 SNI [回车=$default]: " 4 "$default")"
   case "$choice" in
     1) printf '%s' "${SNI_OPTIONS[0]}" ;;
     2) printf '%s' "${SNI_OPTIONS[1]}" ;;
@@ -1929,9 +1949,10 @@ choose_node_ip_version() {
   if [[ -n "$DETECTED_PUBLIC_IPV4" && -n "$DETECTED_PUBLIC_IPV6" ]]; then
     printf "请选择 %s 客户端连接地址：\n1. 仅 IPv4  %s\n2. 仅 IPv6  %s\n3. IPv4 + IPv6\n4. 手动输入 IP 或域名\n0. 返回\n" "$label" "$DETECTED_PUBLIC_IPV4" "$DETECTED_PUBLIC_IPV6" >&2
     while true; do
-      safe_read "请选择 [1-4]: " choice || return 1
+      safe_read "请选择 [1-4，回车=3]: " choice || return 1
+      choice="${choice:-3}"
       case "$choice" in
-        0) return 1 ;;
+        0) menu_cancel ;;
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
         2) SELECTED_IP_VERSION=ipv6; return 0 ;;
         3) SELECTED_IP_VERSION=dual; return 0 ;;
@@ -1942,9 +1963,10 @@ choose_node_ip_version() {
   elif [[ -n "$DETECTED_PUBLIC_IPV4" ]]; then
     printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv4  %s\n2. 手动输入 IP 或域名\n0. 返回\n" "$label" "$DETECTED_PUBLIC_IPV4" >&2
     while true; do
-      safe_read "请选择 [1-2]: " choice || return 1
+      safe_read "请选择 [1-2，回车=1]: " choice || return 1
+      choice="${choice:-1}"
       case "$choice" in
-        0) return 1 ;;
+        0) menu_cancel ;;
         1) SELECTED_IP_VERSION=ipv4; return 0 ;;
         2) break ;;
         *) warn "请输入 1-2 的数字。" >&2 ;;
@@ -1953,9 +1975,10 @@ choose_node_ip_version() {
   elif [[ -n "$DETECTED_PUBLIC_IPV6" ]]; then
     printf "请选择 %s 客户端连接地址：\n1. 检测到的 IPv6  %s\n2. 手动输入 IP 或域名\n0. 返回\n" "$label" "$DETECTED_PUBLIC_IPV6" >&2
     while true; do
-      safe_read "请选择 [1-2]: " choice || return 1
+      safe_read "请选择 [1-2，回车=1]: " choice || return 1
+      choice="${choice:-1}"
       case "$choice" in
-        0) return 1 ;;
+        0) menu_cancel ;;
         1) SELECTED_IP_VERSION=ipv6; return 0 ;;
         2) break ;;
         *) warn "请输入 1-2 的数字。" >&2 ;;
@@ -1966,7 +1989,7 @@ choose_node_ip_version() {
   fi
   while true; do
     safe_read "请输入客户端连接 IPv4、IPv6 或域名（0 返回）: " input || return 1
-    [[ "$input" != 0 ]] || return 1
+    [[ "$input" != 0 ]] || menu_cancel
     if SELECTED_ENDPOINT_HOST="$(endpoint_host_value "$input")"; then
       SELECTED_IP_VERSION=custom
       return 0
@@ -2252,9 +2275,10 @@ PY
 
 
 protocol_link_rows() {
-  local proto
-  PROTOCOL_ONLY="" PROTOCOL_VARIANT="" protocol_link_rows_base || return 1
+  local only="${1:-}" proto
+  PROTOCOL_ONLY="$only" PROTOCOL_VARIANT="" protocol_link_rows_base || return 1
   for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls trojan shadowsocks vmess_tcp vmess_http; do
+    [[ -z "$only" || "$proto" == "$only" ]] || continue
     if [[ "$(proto_value "$proto" enabled false)" == "true" && "$(proto_value "$proto" ip_version auto)" == "dual" ]]; then
       PROTOCOL_ONLY="$proto" PROTOCOL_VARIANT=ipv6 protocol_link_rows_base || return 1
     fi
@@ -2647,7 +2671,7 @@ show_qr() {
 }
 
 show_protocol_links() {
-  local show_qr_codes="${1:-true}" label link found=0
+  local show_qr_codes="${1:-true}" only="${2:-}" label link found=0
   while IFS=$'\t' read -r label link; do
     [[ -n "${link:-}" ]] || continue
     found=1
@@ -2655,7 +2679,7 @@ show_protocol_links() {
     printf "${MAGENTA}%s${NC}\n" "$link"
     [[ "$show_qr_codes" == "true" ]] && show_qr "$link"
     printf "\n"
-  done < <(protocol_link_rows)
+  done < <(protocol_link_rows "$only")
   (( found == 1 )) || printf "暂无协议链接。\n\n"
 }
 
@@ -4052,6 +4076,11 @@ update_script() {
     fail "脚本更新失败：新脚本为空、不完整或语法检查未通过。"
     return 1
   fi
+  if cmp -s "$tmp" "$SCRIPT"; then
+    rm -f "$tmp"
+    info "已是最新版本 ${SCRIPT_VERSION}，无需更新。"
+    return 0
+  fi
   latest="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$tmp" | head -n1)"
   if [[ -z "$latest" || "$(printf '%s\n%s\n' "$latest" "$SCRIPT_VERSION" | sort -V | tail -n1)" != "$latest" ]]; then
     rm -f "$tmp"
@@ -4147,7 +4176,7 @@ add_protocol_menu() {
   printf '0. 返回\n'
   local choice proto
   choice="$(ask_menu "请选择: " "${#AVAILABLE_PROTOCOLS[@]}")"
-  [[ "$choice" != 0 ]] || return 1
+  [[ "$choice" != 0 ]] || menu_cancel
   proto="${AVAILABLE_PROTOCOLS[choice-1]}"
   maybe_set_node_prefix || return 1
   case "$proto" in
@@ -4164,7 +4193,7 @@ add_protocol_menu() {
   esac
   restart_if_running || return 1
   info "协议已添加。"
-  show_protocol_details
+  show_protocol_details "$proto"
 }
 
 change_protocol_ip_version() {
@@ -4243,7 +4272,7 @@ change_protocol_config() {
         2) value="$(ask_text "Mixed 用户名" "$(proto_value mixed username daimon)")" || return 1; apply_state_change config set_protocol mixed "username=$value" || return 1 ;;
         3) value="$(ask_text "Mixed 密码" "$(proto_value mixed password daimon)")" || return 1; apply_state_change config set_protocol mixed "password=$value" || return 1 ;;
         4) change_protocol_ip_version mixed "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     vless_reality)
@@ -4262,7 +4291,7 @@ change_protocol_config() {
           apply_state_change config set_protocol vless_reality "private_key=$private_key" "public_key=$public_key" "short_id=$(rand_hex 8)" || return 1
           ;;
         5) change_protocol_ip_version vless_reality "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     vmess_ws)
@@ -4274,12 +4303,12 @@ change_protocol_config() {
         3)
           printf '1. 开启 TLS\n2. 关闭 TLS\n0. 返回\n'
           value="$(ask_menu "请选择: " 2)"
-          [[ "$value" != 0 ]] || return 1
+          [[ "$value" != 0 ]] || menu_cancel
           [[ "$value" == 1 ]] && value=true || value=false
           apply_state_change config set_protocol vmess_ws "tls=$value" || return 1
           ;;
         4) change_protocol_ip_version vmess_ws "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     hysteria2)
@@ -4291,7 +4320,7 @@ change_protocol_config() {
         3) value="$(pick_sni "$(proto_value hysteria2 sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol hysteria2 "sni=$value" || return 1 ;;
         4) hopping="$(ask_hopping "$label" "$(proto_value hysteria2 hop_start "")" "$(proto_value hysteria2 hop_end "")")" || return 1; IFS=$'\t' read -r hop_start hop_end <<<"$hopping"; [[ -z "$hop_start" ]] || ensure_hopping_tools || return 1; apply_state_change config set_protocol hysteria2 "hop_start=$hop_start" "hop_end=$hop_end" || return 1 ;;
         5) change_protocol_ip_version hysteria2 "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     tuic)
@@ -4303,7 +4332,7 @@ change_protocol_config() {
         3) value="$(ask_text "Tuic-v5 密码" "$(proto_value tuic password)")" || return 1; apply_state_change config set_protocol tuic "password=$value" || return 1 ;;
         4) value="$(pick_sni "$(proto_value tuic sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol tuic "sni=$value" || return 1 ;;
         5) change_protocol_ip_version tuic "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     anytls)
@@ -4314,7 +4343,7 @@ change_protocol_config() {
         2) value="$(ask_text "Anytls 密码" "$(proto_value anytls password)")" || return 1; apply_state_change config set_protocol anytls "password=$value" || return 1 ;;
         3) value="$(pick_sni "$(proto_value anytls sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol anytls "sni=$value" || return 1 ;;
         4) change_protocol_ip_version anytls "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     trojan)
@@ -4325,7 +4354,7 @@ change_protocol_config() {
         2) value="$(ask_text "Trojan 密码" "$(proto_value trojan password)")" || return 1; apply_state_change config set_protocol trojan "password=$value" || return 1 ;;
         3) value="$(pick_sni "$(proto_value trojan sni "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol trojan "sni=$value" || return 1 ;;
         4) change_protocol_ip_version trojan "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     shadowsocks)
@@ -4336,7 +4365,7 @@ change_protocol_config() {
         2) value="$(ask_text "Shadowsocks 密码" "$(proto_value shadowsocks password)")" || return 1; apply_state_change config set_protocol shadowsocks "password=$value" || return 1 ;;
         3) value="$(ask_text "Shadowsocks 加密方式" "$(proto_value shadowsocks method aes-128-gcm)")" || return 1; apply_state_change config set_protocol shadowsocks "method=$value" || return 1 ;;
         4) change_protocol_ip_version shadowsocks "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     vmess_tcp)
@@ -4346,7 +4375,7 @@ change_protocol_config() {
         1) change_protocol_port "$proto" "$label" || return 1 ;;
         2) value="$(ask_text "Vmess-tcp UUID" "$(proto_value vmess_tcp uuid)")" || return 1; apply_state_change config set_protocol vmess_tcp "uuid=$value" || return 1 ;;
         3) change_protocol_ip_version vmess_tcp "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
     vmess_http)
@@ -4358,7 +4387,7 @@ change_protocol_config() {
         3) value="$(pick_sni "$(proto_value vmess_http host "${SNI_OPTIONS[0]}")")" || return 1; apply_state_change config set_protocol vmess_http "host=$value" || return 1 ;;
         4) value="$(ask_text "Vmess-http 路径" "$(proto_value vmess_http path /vmess-http)")" || return 1; [[ "$value" == /* ]] || value="/$value"; apply_state_change config set_protocol vmess_http "path=$value" || return 1 ;;
         5) change_protocol_ip_version vmess_http "$label" || return 1 ;;
-        0) return 1 ;;
+        0) menu_cancel ;;
       esac
       ;;
   esac
@@ -4366,7 +4395,7 @@ change_protocol_config() {
     restart_if_running || return 1
   fi
   info "配置已更新。"
-  show_protocol_details
+  show_protocol_details "$proto"
   return 0
 }
 
@@ -4393,7 +4422,7 @@ change_subscription_config() {
   printf '6. 切换节点连接地址：IPv4 / IPv6 / 双栈 / 手动地址（单协议或全部）\n0. 返回\n'
   while true; do
     choice="$(ask_menu "请选择: " 6)"
-    [[ "$choice" != 0 ]] || return 1
+    [[ "$choice" != 0 ]] || menu_cancel
     if [[ "$http_enabled" == false && "$choice" != 6 ]] || [[ "$choice" == 4 && -z "${domain:-}" ]]; then
       warn "请选择当前菜单显示的编号。"
       continue
@@ -4417,7 +4446,7 @@ change_subscription_config() {
     2)
       while true; do
         safe_read "请输入新 token，回车随机生成（0 返回）: " input || return 1
-        [[ "$input" != 0 ]] || return 1
+        [[ "$input" != 0 ]] || menu_cancel
         new_token="${input:-$(rand_token)}"
         valid_token "$new_token" && break
         warn "token 只能包含字母和数字。"
@@ -4428,7 +4457,7 @@ change_subscription_config() {
     3)
       while true; do
         safe_read "请输入 HTTPS 订阅域名（0 返回）: " domain || return 1
-        [[ "$domain" != 0 ]] || return 1
+        [[ "$domain" != 0 ]] || menu_cancel
         valid_domain "$domain" && break
         warn "请输入有效域名。"
       done
@@ -4441,7 +4470,7 @@ change_subscription_config() {
     5)
       while true; do
         safe_read "请输入订阅下载 IPv4、IPv6 或域名，回车恢复自动（0 返回）: " input || return 1
-        [[ "$input" != 0 ]] || return 1
+        [[ "$input" != 0 ]] || menu_cancel
         if [[ -z "$input" ]]; then endpoint_host=""; break; fi
         if endpoint_host="$(endpoint_host_value "$input")"; then break; fi
         warn "地址格式错误，不要包含协议、端口或路径。"
@@ -4457,7 +4486,7 @@ change_subscription_config() {
       else
         change_protocol_ip_version "$SELECTED_PROTOCOL" "$(node_base_name "$SELECTED_PROTOCOL")" || return 1
         info "节点连接地址已更新，端口和认证信息未改变。"
-        show_protocol_details
+        show_protocol_details "$SELECTED_PROTOCOL"
       fi
       return 0
       ;;
@@ -4484,7 +4513,7 @@ delete_protocol_menu() {
         invalid=true
         break
       fi
-      [[ "$choice" != 0 ]] || return 1
+      [[ "$choice" != 0 ]] || menu_cancel
       if ((choice == max+1)); then
         protocols=("${AVAILABLE_PROTOCOLS[@]}")
       else
@@ -4637,7 +4666,10 @@ show_protocols() {
   printf "\n"
 }
 
+# With a protocol, show only its nodes and the subscription URLs, so the
+# result of a change is not scrolled away by every other node's QR code.
 show_protocol_details() {
+  local only="${1:-}"
   is_alpine || load_state_cache || true
   if lite_mode; then
     title "NAT 轻量 VLESS Reality 节点链接如下："
@@ -4651,6 +4683,17 @@ show_protocol_details() {
   if lite_mode; then
     show_protocol_links false
     printf "${CYAN}HTTP/HTTPS订阅服务:${NC}未安装\n\n"
+    return
+  fi
+  if [[ -n "$only" && "$only" != all ]]; then
+    show_protocol_links true "$only"
+    printf "${CYAN}HTTP/IP订阅链接(v2rayN默认):${NC}\n${MAGENTA}%s${NC}\n" "$(sub_http_link)"
+    printf "${CYAN}HTTP/IP Clash/Mihomo订阅链接:${NC}\n${MAGENTA}%s${NC}\n" "$(sub_http_link clash)"
+    if sub_https_link >/dev/null 2>&1; then
+      printf "${CYAN}HTTPS域名订阅链接(v2rayN默认):${NC}\n${MAGENTA}%s${NC}\n" "$(sub_https_link)"
+      printf "${CYAN}HTTPS域名 Clash/Mihomo订阅链接:${NC}\n${MAGENTA}%s${NC}\n" "$(sub_https_link clash)"
+    fi
+    printf "\n全部节点和订阅二维码：主菜单 10。\n"
     return
   fi
   show_protocol_links
@@ -4713,6 +4756,15 @@ run_manage() {
   done
 }
 
+main_menu_item_hidden() {
+  case "$1" in
+    3) is_alpine ;;
+    6) is_alpine || lite_mode ;;
+    12) ! has_cmd ufw ;;
+    *) return 1 ;;
+  esac
+}
+
 main_menu() {
   while true; do
     clear_screen
@@ -4748,21 +4800,28 @@ main_menu() {
     fi
     has_cmd ufw && menu_line 12 "一键放行所有缺失端口"
     menu_line 14 "设置节点名称前缀"
-    case "$(ask_menu "请选择: " 14)" in
-      1) update_script || true; pause ;;
+    local choice
+    while true; do
+      choice="$(ask_menu "请选择: " 14)"
+      main_menu_item_hidden "$choice" || break
+      warn "请选择当前菜单显示的编号。"
+    done
+    MENU_CANCELLED=false
+    case "$choice" in
+      1) update_script || true; menu_pause ;;
       2) delete_script || true ;;
-      3) install_sing_box || true; pause ;;
-      4) uninstall_sing_box || true; pause ;;
+      3) install_sing_box || true; menu_pause ;;
+      4) uninstall_sing_box || true; menu_pause ;;
       5) run_manage ;;
-      6) add_all_protocols && restart_if_running; pause ;;
-      7) add_protocol_menu || true; pause ;;
-      8) change_protocol_config || true; pause ;;
-      9) delete_protocol_menu || true; pause ;;
+      6) add_all_protocols && restart_if_running; menu_pause ;;
+      7) add_protocol_menu || true; menu_pause ;;
+      8) change_protocol_config || true; menu_pause ;;
+      9) delete_protocol_menu || true; menu_pause ;;
       10) view_protocols ;;
-      11) change_subscription_config || true; pause ;;
-      12) allow_missing_ufw_ports || true; pause ;;
-      13) install_nat_lite || true; pause ;;
-      14) node_prefix_menu || true; pause ;;
+      11) change_subscription_config || true; menu_pause ;;
+      12) allow_missing_ufw_ports || true; menu_pause ;;
+      13) install_nat_lite || true; menu_pause ;;
+      14) node_prefix_menu || true; menu_pause ;;
       0) exit 0 ;;
     esac
   done
