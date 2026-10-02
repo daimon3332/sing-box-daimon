@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.11.2"
+SCRIPT_VERSION="1.11.3"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -1851,10 +1851,18 @@ apply_protocol_firewall() {
 }
 
 
+public_ip() {
+  local family="$1" url ip
+  shift
+  for url in "$@"; do
+    ip="$(curl "-${family}fs" --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)"
+    valid_ip_address "$ip" "$family" && { printf '%s' "$ip"; return 0; }
+  done
+  return 0
+}
+
 public_ipv4() {
-  local ip
-  ip="$(curl -4fs --max-time 5 https://api.ipify.org 2>/dev/null || true)"
-  valid_ip_address "$ip" 4 && printf '%s' "$ip" || true
+  public_ip 4 https://api.ipify.org https://api-ipv4.ip.sb/ip https://ipv4.icanhazip.com
 }
 
 set_selected_protocol() {
@@ -1864,9 +1872,7 @@ set_selected_protocol() {
 }
 
 public_ipv6() {
-  local ip
-  ip="$(curl -6fs --max-time 5 https://api64.ipify.org 2>/dev/null || true)"
-  valid_ip_address "$ip" 6 && printf '%s' "$ip" || true
+  public_ip 6 https://api64.ipify.org https://api-ipv6.ip.sb/ip https://ipv6.icanhazip.com
 }
 
 status_cache_dir() {
