@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.11.3"
+SCRIPT_VERSION="1.12.0"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -13,6 +13,7 @@ SUB="$ROOT/sub"
 LOG="$ROOT/log"
 FIREWALL="$ROOT/firewall"
 UFW_RULES="$FIREWALL/ufw.rules"
+PORT_HISTORY="$ROOT/port-history"
 STATE="$ROOT/state.json"
 SCRIPT="$ROOT/sb.sh"
 SUB_SERVER="$ROOT/sub_server.py"
@@ -1213,6 +1214,48 @@ random_free_port() {
     fi
   done
   next_free_port 20000 "$exclude"
+}
+
+port_history_used() {
+  [[ -s "$PORT_HISTORY" ]] && awk -v port="$1" '$1 == port {found = 1} END {exit !found}' "$PORT_HISTORY"
+}
+
+record_port_history() {
+  local proto="$1" port="$2" tmp
+  valid_port "$port" || return 0
+  ensure_dirs || return 1
+  tmp="$(mktemp "$ROOT/.port-history.XXXXXX")" || return 1
+  {
+    [[ ! -s "$PORT_HISTORY" ]] || cat "$PORT_HISTORY"
+    printf '%s\t%s\t%s\n' "$port" "$proto" "$(date '+%F %H:%M')"
+  } | tail -n 200 >"$tmp" && mv -f "$tmp" "$PORT_HISTORY" || { rm -f "$tmp"; return 1; }
+}
+
+show_port_history() {
+  local port proto when
+  if [[ ! -s "$PORT_HISTORY" ]]; then
+    printf '暂无历史端口。\n'
+    return 0
+  fi
+  printf '历史端口（最近 200 条，随机更换时会避开）：\n'
+  while IFS=$'\t' read -r port proto when; do
+    printf '  %-6s %-16s %s\n' "$port" "$(node_base_name "$proto")" "$when"
+  done < <(tac "$PORT_HISTORY")
+}
+
+# Random port for a batch: skips ports in use now, ports used before (likely
+# already blocked) and ports already picked earlier in the same batch.
+random_rotation_port() {
+  local taken=" ${1:-} " port i
+  for i in {1..200}; do
+    port="$(random_high_port)"
+    [[ "$taken" != *" $port "* ]] || continue
+    port_history_used "$port" && continue
+    port_used "$port" && continue
+    printf '%s' "$port"
+    return 0
+  done
+  return 1
 }
 
 ask_port() {
@@ -4259,7 +4302,9 @@ change_protocol_port() {
   old_port="$(proto_value "$proto" port)"
   port="$(ask_port "$label" "$old_port" "$old_port")" || return 1
   [[ "$port" != "$old_port" ]] || { info "端口未变化。"; return 1; }
-  apply_state_change config set_protocol "$proto" "port=$port"
+  ! port_history_used "$port" || warn "端口 $port 曾经使用过，可能已被封锁。"
+  apply_state_change config set_protocol "$proto" "port=$port" || return 1
+  record_port_history "$proto" "$old_port" || warn "历史端口记录写入失败。"
 }
 
 change_protocol_config() {
@@ -4538,6 +4583,71 @@ delete_protocol_menu() {
   info "协议已删除 ${#protocols[@]} 个。"
 }
 
+set_protocol_ports() {
+  local pair
+  for pair in "$@"; do
+    set_protocol "${pair%%=*}" "port=${pair#*=}" || return 1
+  done
+}
+
+rotate_ports_menu() {
+  require_core_installed || return 1
+  local input item choice max invalid proto port taken="" protocols=() pairs=()
+  title "一键更换协议端口"
+  printf '随机生成新端口（20000-60000），自动避开已占用端口和历史端口。\n'
+  printf '需要指定端口请用主菜单 8 修改协议。\n'
+  ! lite_mode || warn "NAT 模式：更换后请在服务商面板把新端口映射到相同内部端口。"
+  protocol_menu_items
+  max=${#AVAILABLE_PROTOCOLS[@]}
+  ((max)) || { warn "尚未添加协议。"; return 1; }
+  printf '%s. 更换全部协议端口\n%s. 查看历史端口\n0. 返回\n' "$((max+1))" "$((max+2))"
+  while true; do
+    safe_read "请选择，可多选，如 1 3 或 1,3（0 返回）: " input || return 1
+    input="${input//,/ }"
+    protocols=()
+    invalid=false
+    for item in $input; do
+      if ! choice="$(menu_number "$item" "$((max+2))")"; then
+        invalid=true
+        break
+      fi
+      [[ "$choice" != 0 ]] || menu_cancel
+      if ((choice == max+2)); then
+        show_port_history
+        return 0
+      elif ((choice == max+1)); then
+        protocols=("${AVAILABLE_PROTOCOLS[@]}")
+      else
+        proto="${AVAILABLE_PROTOCOLS[choice-1]}"
+        [[ " ${protocols[*]} " == *" $proto "* ]] || protocols+=("$proto")
+      fi
+    done
+    if [[ "$invalid" == false ]] && ((${#protocols[@]})); then break; fi
+    warn "无效选择，请输入上方显示的编号。"
+  done
+  printf '将更换以下 %s 个协议的端口：\n' "${#protocols[@]}"
+  for proto in "${protocols[@]}"; do
+    port="$(random_rotation_port "$taken")" || { fail "没有找到可用的随机端口，未修改任何协议。"; return 1; }
+    taken+=" $port"
+    pairs+=("$proto=$port")
+    printf '  %s: %s -> %s\n' "$(node_base_name "$proto")" "$(proto_value "$proto" port)" "$port"
+  done
+  ask_yes_no "确认更换？" n || return 1
+  local -A old_ports=()
+  for proto in "${protocols[@]}"; do old_ports[$proto]="$(proto_value "$proto" port)"; done
+  apply_state_change config set_protocol_ports "${pairs[@]}" || return 1
+  for proto in "${protocols[@]}"; do
+    record_port_history "$proto" "${old_ports[$proto]}" || warn "历史端口记录写入失败。"
+  done
+  restart_if_running || return 1
+  info "已更换 ${#protocols[@]} 个协议的端口，旧端口已记入历史。"
+  if lite_mode; then
+    printf '请在主菜单 10 查看并重新导入节点链接。\n'
+  else
+    printf '客户端请更新订阅；单个节点链接可在主菜单 10 查看。\n'
+  fi
+}
+
 delete_selected_protocols() {
   local proto
   for proto in "$@"; do delete_protocol_state "$proto" || return 1; done
@@ -4796,19 +4906,20 @@ main_menu() {
     menu_line 7 "添加协议"
     menu_line 8 "修改协议"
     menu_line 9 "删除协议"
+    menu_line 15 "一键更换协议端口"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
     if is_alpine || lite_mode; then
       menu_line 10 "查看 NAT 节点链接"
       menu_line 11 "更改节点连接地址（IPv4/IPv6）"
     else
-      menu_line 10 "查看协议和综合订阅链接"
-      menu_line 11 "更改综合订阅配置（含节点 IPv4/IPv6）"
+      menu_line 10 "查看订阅链接"
+      menu_line 11 "更改综合订阅链接配置（端口、IP、token等）"
     fi
     has_cmd ufw && menu_line 12 "一键放行所有缺失端口"
     menu_line 14 "设置节点名称前缀"
     local choice
     while true; do
-      choice="$(ask_menu "请选择: " 14)"
+      choice="$(ask_menu "请选择: " 15)"
       main_menu_item_hidden "$choice" || break
       warn "请选择当前菜单显示的编号。"
     done
@@ -4828,6 +4939,7 @@ main_menu() {
       12) allow_missing_ufw_ports || true; menu_pause ;;
       13) install_nat_lite || true; menu_pause ;;
       14) node_prefix_menu || true; menu_pause ;;
+      15) rotate_ports_menu || true; menu_pause ;;
       0) exit 0 ;;
     esac
   done
