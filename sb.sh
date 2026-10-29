@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.0"
+SCRIPT_VERSION="1.14.1"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -4990,6 +4990,7 @@ def validate(data):
     return data
 
 def load_dataset(cache, max_age_days):
+    os.makedirs(os.path.dirname(os.path.abspath(cache)), exist_ok=True)
     fresh = os.path.exists(cache) and time.time() - os.path.getmtime(cache) < max_age_days * 86400
     if not fresh:
         try:
@@ -5172,8 +5173,11 @@ def main():
     if a.selftest:
         return selftest()
     if a.validate:
-        with open(a.validate, encoding="utf-8") as f:
-            data = validate(json.load(f))
+        try:
+            with open(a.validate, encoding="utf-8") as f:
+                data = validate(json.load(f))
+        except (OSError, ValueError) as exc:
+            raise SystemExit(f"invalid dataset {a.validate}: {exc}")
         print(len(data))
         return
     country = (a.country or "").upper()

@@ -79,6 +79,10 @@ PY
 [[ "$(reality_finder --validate "$TMPDIR/ds.json")" == 1200 ]]
 printf '[]' >"$TMPDIR/bad.json"
 ! reality_finder --validate "$TMPDIR/bad.json" >/dev/null 2>&1 || exit 1
+out="$(reality_finder --validate "$TMPDIR/missing.json" 2>&1 || true)"
+[[ "$out" == *"invalid dataset"* && "$out" != *Traceback* ]]
+# The cache directory is created on demand.
+reality_finder --country ZZ --cache "$TMPDIR/new/dir/u.json" --max-age 100000 2>/dev/null || true
 ! reality_finder --country JPN --cache "$TMPDIR/ds.json" >/dev/null 2>&1 || exit 1
 
 # SNI chooser for manual and one-click add: Enter = random, 2 = scan, 3 = custom.
