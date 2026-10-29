@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.5"
+SCRIPT_VERSION="1.14.6"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -4971,7 +4971,9 @@ CDN_HEADER = re.compile(r"^(cf-ray|x-amz-cf-id|x-amz-cf-pop|x-pantheon-[\w-]+|x-
 # CDN / WAF networks: every customer shares the same edge, so they are never used.
 CDN_ASNS = {13335, 209242, 20940, 16625, 16702, 18680, 18717, 21342, 21357, 21399, 23454, 23455, 24319, 31107, 31108, 31109, 31110,
             32787, 33905, 34164, 35204, 35993, 35994, 36183, 54113, 19551, 62571, 60068, 199524, 202422, 202623, 30148, 12989, 20446,
-            33438, 22822, 15133, 200325, 57724, 200449, 205585}
+            33438, 22822, 15133, 200325, 57724, 200449, 205585,
+            # Multi-tenant site platforms: WordPress VIP (Automattic), Squarespace, Wix, Shopify, GitHub Pages.
+            2635, 53831, 58182, 62679, 36459}
 CLOUD_ASNS = {16509, 14618, 8987, 15169, 396982, 19527, 8075, 31898, 14061, 24940, 16276, 20473, 63949, 45102, 132203, 906}
 SHARED_NETS = [ipaddress.ip_network(n) for n in ("35.185.44.232/32", "23.185.0.0/24", "185.199.108.0/22", "75.2.60.5/32", "99.83.190.102/32")]
 # Hosted site platforms: anyone can publish under these, so they are never candidates.
@@ -5064,7 +5066,15 @@ def asn_of(ip):
         net = http_json("https://stat.ripe.net/data/network-info/data.json?resource=" + ip)["data"]
         asn = int(net["asns"][0])
     except Exception:
-        return 0, ""
+        # Fallback source; an unknown network is never accepted as a target.
+        try:
+            org = http_json("https://ipinfo.io/" + ip + "/json").get("org", "")
+            asn, holder = int(org.split()[0][2:]), org.split(" ", 1)[1] if " " in org else ""
+        except Exception:
+            return 0, ""
+        with ASN_LOCK:
+            ASN_CACHE.setdefault(asn, re.sub(r"\s+", " ", holder)[:40])
+            return asn, ASN_CACHE[asn]
     with ASN_LOCK:
         if asn in ASN_CACHE:
             return asn, ASN_CACHE[asn]
@@ -5119,7 +5129,7 @@ def full_check(item, vps_asn, shared=frozenset()):
     if not res or res[0] != "200" or classify_headers(res[2]):
         return None
     asn, holder = asn_of(ip)
-    if asn in CDN_ASNS:
+    if not asn or asn in CDN_ASNS:
         return None
     flags = []
     if vps_asn and asn == vps_asn:
@@ -5168,7 +5178,7 @@ def selftest():
     assert classify_headers("HTTP/2 200\r\nx-iinfo: 51-1 0NNN\r\n")
     assert classify_headers("HTTP/2 200\r\nset-cookie: visid_incap_823419=abc; HttpOnly\r\n")
     assert not classify_headers("HTTP/2 200\r\nserver: nginx\r\ncontent-type: text/html\r\nset-cookie: PHPSESSID=1\r\n")
-    assert 19551 in CDN_ASNS and 13335 in CDN_ASNS
+    assert 19551 in CDN_ASNS and 13335 in CDN_ASNS and 2635 in CDN_ASNS
     plat = [{"alpha_two_code": "MY", "domains": ["kidu-darululum.blogspot.com"]}, {"alpha_two_code": "MY", "domains": ["x.github.io", "uniten.edu.my"]}]
     assert candidates(plat, "MY") == ["www.uniten.edu.my", "uniten.edu.my"], candidates(plat, "MY")
     assert ACADEMIC_HOLDER.search("UNITEN-AS-AP - UNIVERSITI TENAGA NASIONAL") and ACADEMIC_HOLDER.search("SINET - Research Organization of Information and Systems")
