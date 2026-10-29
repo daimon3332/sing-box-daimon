@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.12.0"
+SCRIPT_VERSION="1.13.0"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -2235,8 +2235,8 @@ PY
     hy_port="$(proto_value hysteria2 port)"
     hy_hop_start="$(proto_value hysteria2 hop_start "")"
     hy_hop_end="$(proto_value hysteria2 hop_end "")"
-    [[ -n "$hy_hop_start" && -n "$hy_hop_end" ]] && hy_mport="&mport=$hy_hop_start-$hy_hop_end" || hy_mport=""
-    printf '%s\thysteria2://%s@%s:%s?security=tls&alpn=h3&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1&hop_interval=30s%s#%s\n' "$(node_name hysteria2)" "$hy_password" "$url_host" "$hy_port" "$hy_sni" "$hy_mport" "$(url_encode "$(node_name hysteria2)")"
+    [[ -n "$hy_hop_start" && -n "$hy_hop_end" ]] && hy_mport="&mport=$hy_hop_start-$hy_hop_end&hop_interval=30s" || hy_mport=""
+    printf '%s\thysteria2://%s@%s:%s?security=tls&alpn=h3&sni=%s&insecure=1&allowInsecure=1&allow_insecure=1%s#%s\n' "$(node_name hysteria2)" "$hy_password" "$url_host" "$hy_port" "$hy_sni" "$hy_mport" "$(url_encode "$(node_name hysteria2)")"
   fi
   if [[ "$(proto_value tuic enabled false)" == "true" && ( -z "$PROTOCOL_ONLY" || "$PROTOCOL_ONLY" == tuic ) ]]; then
     local tuic_auth tuic_sni
@@ -3385,13 +3385,14 @@ show_domain_dns() {
 }
 
 stop_http_services_for_acme() {
-  NGINX_WAS_RUNNING=false
-  if systemctl is-active --quiet nginx; then
-    NGINX_WAS_RUNNING=true
-    systemctl stop nginx
-  fi
-  systemctl stop apache2 >/dev/null 2>&1 || true
-  systemctl stop httpd >/dev/null 2>&1 || true
+  local service
+  ACME_STOPPED_SERVICES=()
+  for service in nginx apache2 httpd; do
+    if systemctl is-active --quiet "$service"; then
+      ACME_STOPPED_SERVICES+=("$service")
+      systemctl stop "$service" >/dev/null 2>&1 || true
+    fi
+  done
   sleep 1
   if lsof -iTCP:80 -sTCP:LISTEN >/dev/null 2>&1; then
     fail "80 端口仍被占用，无法使用 standalone 模式申请证书。"
@@ -3400,7 +3401,11 @@ stop_http_services_for_acme() {
 }
 
 restart_nginx_after_acme() {
+  local service
   systemctl start nginx >/dev/null 2>&1 || true
+  for service in "${ACME_STOPPED_SERVICES[@]+"${ACME_STOPPED_SERVICES[@]}"}"; do
+    [[ "$service" == nginx ]] || systemctl start "$service" >/dev/null 2>&1 || true
+  done
 }
 
 subscription_cert_exists() {
@@ -3805,9 +3810,9 @@ reality_keypair() {
 require_core_installed() {
   [[ -x "$BIN" ]] && return 0
   if is_alpine; then
-    warn "尚未安装 sing-box 内核，请先执行菜单 13：NAT 轻量安装。"
+    warn "尚未安装 sing-box 内核，请先执行菜单 4：NAT 轻量安装。"
   else
-    warn "尚未安装 sing-box 内核，请先执行菜单 3：标准安装，或菜单 13：NAT 轻量安装。"
+    warn "尚未安装 sing-box 内核，请先执行菜单 3：标准安装，或菜单 4：NAT 轻量安装。"
   fi
   return 1
 }
@@ -3815,9 +3820,9 @@ require_core_installed() {
 add_mixed() {
   local port username password
   choose_node_ip_version "Mixed" || return 1
-  port="$(ask_port "Mixed" 30000)" || return 1
-  username="$(ask_text "Mixed 用户名" "daimon")" || return 1
-  password="$(ask_text "Mixed 密码" "daimon")" || return 1
+  port="$(ask_port "Mixed" "$(random_free_port)")" || return 1
+  username="$(ask_text "Mixed 用户名" "$(rand_hex 4)")" || return 1
+  password="$(ask_text "Mixed 密码" "$(rand_hex 12)")" || return 1
   apply_state_change config set_selected_protocol mixed "port=$port" "username=$username" "password=$password" || return 1
 }
 
@@ -3944,7 +3949,7 @@ add_all_protocols() {
 }
 
 add_missing_protocols() {
-  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(next_free_port 30000)" "username=daimon" "password=daimon" || return 1
+  [[ "$(proto_value mixed enabled false)" == "true" ]] || set_selected_protocol mixed "port=$(random_free_port)" "username=$(rand_hex 4)" "password=$(rand_hex 12)" || return 1
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] || {
     local keys private_key public_key
     keys="$(reality_keypair || true)"
@@ -3967,7 +3972,7 @@ add_missing_protocols() {
 install_sing_box() {
   need_root
   if is_alpine; then
-    fail "Alpine 仅支持菜单 13 的 NAT 轻量 VLESS Reality 安装。"
+    fail "Alpine 仅支持菜单 4 的 NAT 轻量 VLESS Reality 安装。"
     return 1
   fi
   install_dependencies standard || return 1
@@ -4079,7 +4084,7 @@ uninstall_sing_box() {
   save_firewall_rules
   rm -f "$SERVICE" "$SUB_SERVICE"
   is_alpine || systemctl daemon-reload >/dev/null 2>&1 || true
-  rm -rf "$ROOT/bin" "$CONF" "$CERT" "$SUB" "$LOG"
+  rm -rf "${ROOT:?}/bin" "$CONF" "$CERT" "$SUB" "$LOG"
   rm -f "$STATE" "$STATE.tmp" "$SUB_SERVER" "$UFW_RULES"
   invalidate_state_cache
   remove_alpine_managed_packages false
@@ -4595,7 +4600,7 @@ rotate_ports_menu() {
   local input item choice max invalid proto port taken="" protocols=() pairs=()
   title "一键更换协议端口"
   printf '随机生成新端口（20000-60000），自动避开已占用端口和历史端口。\n'
-  printf '需要指定端口请用主菜单 8 修改协议。\n'
+  printf '需要指定端口请用主菜单 9 修改协议。\n'
   ! lite_mode || warn "NAT 模式：更换后请在服务商面板把新端口映射到相同内部端口。"
   protocol_menu_items
   max=${#AVAILABLE_PROTOCOLS[@]}
@@ -4642,9 +4647,9 @@ rotate_ports_menu() {
   restart_if_running || return 1
   info "已更换 ${#protocols[@]} 个协议的端口，旧端口已记入历史。"
   if lite_mode; then
-    printf '请在主菜单 10 查看并重新导入节点链接。\n'
+    printf '请在主菜单 12 查看并重新导入节点链接。\n'
   else
-    printf '客户端请更新订阅；单个节点链接可在主菜单 10 查看。\n'
+    printf '客户端请更新订阅；单个节点链接可在主菜单 12 查看。\n'
   fi
 }
 
@@ -4809,7 +4814,7 @@ show_protocol_details() {
       printf "${CYAN}HTTPS域名订阅链接(v2rayN默认):${NC}\n${MAGENTA}%s${NC}\n" "$(sub_https_link)"
       printf "${CYAN}HTTPS域名 Clash/Mihomo订阅链接:${NC}\n${MAGENTA}%s${NC}\n" "$(sub_https_link clash)"
     fi
-    printf "\n全部节点和订阅二维码：主菜单 10。\n"
+    printf "\n全部节点和订阅二维码：主菜单 12。\n"
     return
   fi
   show_protocol_links
@@ -4875,8 +4880,8 @@ run_manage() {
 main_menu_item_hidden() {
   case "$1" in
     3) is_alpine ;;
-    6) is_alpine || lite_mode ;;
-    12) ! has_cmd ufw ;;
+    7) is_alpine || lite_mode ;;
+    14) ! has_cmd ufw ;;
     *) return 1 ;;
   esac
 }
@@ -4896,27 +4901,27 @@ main_menu() {
     menu_line 2 "删除脚本"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
     is_alpine || menu_line 3 "标准安装 Sing-box"
-    menu_line 13 "NAT 轻量安装：仅 Vless-reality"
-    menu_line 4 "删除卸载 Sing-box"
-    menu_line 5 "Sing-box运行管理"
+    menu_line 4 "NAT 轻量安装：仅 Vless-reality"
+    menu_line 5 "删除卸载 Sing-box"
+    menu_line 6 "Sing-box运行管理"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
     if ! is_alpine && ! lite_mode; then
-      menu_line 6 "一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls"
+      menu_line 7 "一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls"
     fi
-    menu_line 7 "添加协议"
-    menu_line 8 "修改协议"
-    menu_line 9 "删除协议"
-    menu_line 15 "一键更换协议端口"
+    menu_line 8 "添加协议"
+    menu_line 9 "修改协议"
+    menu_line 10 "删除协议"
+    menu_line 11 "一键更换协议端口"
     printf "${DIM}%s${NC}\n" '----------------------------------------'
     if is_alpine || lite_mode; then
-      menu_line 10 "查看 NAT 节点链接"
-      menu_line 11 "更改节点连接地址（IPv4/IPv6）"
+      menu_line 12 "查看 NAT 节点链接"
+      menu_line 13 "更改节点连接地址（IPv4/IPv6）"
     else
-      menu_line 10 "查看订阅链接"
-      menu_line 11 "更改综合订阅链接配置（端口、IP、token等）"
+      menu_line 12 "查看订阅链接"
+      menu_line 13 "更改综合订阅链接配置（端口、IP、token等）"
     fi
-    has_cmd ufw && menu_line 12 "一键放行所有缺失端口"
-    menu_line 14 "设置节点名称前缀"
+    has_cmd ufw && menu_line 14 "一键放行所有缺失端口"
+    menu_line 15 "设置节点名称前缀"
     local choice
     while true; do
       choice="$(ask_menu "请选择: " 15)"
@@ -4928,18 +4933,18 @@ main_menu() {
       1) update_script || true; menu_pause ;;
       2) delete_script || true ;;
       3) install_sing_box || true; menu_pause ;;
-      4) uninstall_sing_box || true; menu_pause ;;
-      5) run_manage ;;
-      6) add_all_protocols && restart_if_running; menu_pause ;;
-      7) add_protocol_menu || true; menu_pause ;;
-      8) change_protocol_config || true; menu_pause ;;
-      9) delete_protocol_menu || true; menu_pause ;;
-      10) view_protocols ;;
-      11) change_subscription_config || true; menu_pause ;;
-      12) allow_missing_ufw_ports || true; menu_pause ;;
-      13) install_nat_lite || true; menu_pause ;;
-      14) node_prefix_menu || true; menu_pause ;;
-      15) rotate_ports_menu || true; menu_pause ;;
+      4) install_nat_lite || true; menu_pause ;;
+      5) uninstall_sing_box || true; menu_pause ;;
+      6) run_manage ;;
+      7) add_all_protocols && restart_if_running; menu_pause ;;
+      8) add_protocol_menu || true; menu_pause ;;
+      9) change_protocol_config || true; menu_pause ;;
+      10) delete_protocol_menu || true; menu_pause ;;
+      11) rotate_ports_menu || true; menu_pause ;;
+      12) view_protocols ;;
+      13) change_subscription_config || true; menu_pause ;;
+      14) allow_missing_ufw_ports || true; menu_pause ;;
+      15) node_prefix_menu || true; menu_pause ;;
       0) exit 0 ;;
     esac
   done

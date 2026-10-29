@@ -26,9 +26,9 @@ sing-box
 脚本自动识别 Debian 或 Alpine。安装菜单提供两种模式：
 
 - `3. 标准安装 Sing-box`：Debian 等 systemd 系统的完整协议、二维码和 HTTP/HTTPS 订阅能力；Alpine 不支持此模式。
-- `13. NAT 轻量安装：仅 Vless-reality`：支持 Debian 与 Alpine，面向 64 MB 等低内存 NAT 容器，只运行 VLESS Reality。
+- `4. NAT 轻量安装：仅 Vless-reality`：支持 Debian 与 Alpine，面向 64 MB 等低内存 NAT 容器，只运行 VLESS Reality。
 
-NAT 轻量安装只询问一次客户端连接 IPv4、IPv6 或域名；监听端口自动生成，不询问外部端口。请在 NAT 服务商面板把显示的端口映射到相同内部端口。该模式不安装 OpenSSL、qrencode、自签证书或 Python 订阅进程，也不提供 HTTP/HTTPS 订阅和二维码，只显示可直接导入客户端的 VLESS 链接。Debian 使用 Python 做短时状态管理但不常驻；Alpine 不安装 Python，使用 jq 管理状态并由 OpenRC 托管 sing-box。Debian 可通过菜单 `3` 原地升级到标准模式，Alpine 只支持菜单 `13`。
+NAT 轻量安装只询问一次客户端连接 IPv4、IPv6 或域名；监听端口自动生成，不询问外部端口。请在 NAT 服务商面板把显示的端口映射到相同内部端口。该模式不安装 OpenSSL、qrencode、自签证书或 Python 订阅进程，也不提供 HTTP/HTTPS 订阅和二维码，只显示可直接导入客户端的 VLESS 链接。Debian 使用 Python 做短时状态管理但不常驻；Alpine 不安装 Python，使用 jq 管理状态并由 OpenRC 托管 sing-box。Debian 可通过菜单 `3` 原地升级到标准模式，Alpine 只支持菜单 `4`。
 
 NAT 模式会先检查必需命令，依赖齐全时完全跳过包管理器。低内存 Debian 缺少依赖时，脚本从 Debian 官方索引流式筛选所需包、校验 SHA256，再由 dpkg 分阶段安装，不执行高峰值的常规 `apt-get update`。Alpine 只补实际缺少的 Bash、curl、CA 或 jq；sing-box APK 先通过系统 APK 密钥校验签名，再用 BusyBox tar 只提取原生主程序，不把 sing-box 安装进 APK 包数据库。两种系统都使用限速下载、周期同步写盘和同文件系统原子替换。当前最低实测环境为 64 MB RAM、64 MB swap，覆盖 Debian 13 与 Alpine 3.24 x86_64。
 
@@ -37,10 +37,10 @@ NAT 模式会先检查必需命令，依赖齐全时完全跳过包管理器。�
 ### 协议与地址管理
 
 - 修改、删除菜单仅列出已添加协议，编号随当前列表生成；删除支持多选，并在确认前列出协议名称。
-- 菜单 `11` → `6` 可为单个或全部协议选择 IPv4、IPv6、双栈或手动地址。只更新客户端连接地址，不修改端口、认证信息或服务器出站策略。
+- 菜单 `13` → `6` 可为单个或全部协议选择 IPv4、IPv6、双栈或手动地址。只更新客户端连接地址，不修改端口、认证信息或服务器出站策略。
 - 同一菜单的 HTTP/IP 订阅下载地址与节点连接地址相互独立。Alpine/NAT 模式不提供 HTTP/HTTPS 订阅，但保留节点地址管理。
-- 菜单 `15. 一键更换协议端口`：可选全部协议或多选指定协议，随机生成 20000–60000 的新端口，自动避开已占用端口、其他协议端口、Hysteria-2 跳跃范围和历史端口；确认前列出“旧端口 -> 新端口”，所有选中协议在同一次变更中生效，同时更新 UFW 规则、跳跃端口转发和订阅。需要指定端口请用菜单 `8` 修改协议。
-- 更换过的旧端口记录在 `/etc/sing-box/port-history`（最近 200 条），可在菜单 `15` 中查看；菜单 `8` 手动改端口时旧端口同样记入历史，填写历史端口会给出提示。NAT 模式更换后需在服务商面板更新端口映射。
+- 菜单 `11. 一键更换协议端口`：可选全部协议或多选指定协议，随机生成 20000–60000 的新端口，自动避开已占用端口、其他协议端口、Hysteria-2 跳跃范围和历史端口；确认前列出“旧端口 -> 新端口”，所有选中协议在同一次变更中生效，同时更新 UFW 规则、跳跃端口转发和订阅。需要指定端口请用菜单 `9` 修改协议。
+- 更换过的旧端口记录在 `/etc/sing-box/port-history`（最近 200 条），可在菜单 `11` 中查看；菜单 `9` 手动改端口时旧端口同样记入历史，填写历史端口会给出提示。NAT 模式更换后需在服务商面板更新端口映射。
 - `0` 返回上级菜单；输入结束（Ctrl-D）取消当前输入，不自动接受修改。节点变更先生成并检查配置，生成或校验失败时不发布。
 
 手动彻底删除脚本、sing-box、节点、订阅服务、脚本托管的 UFW 规则和跳跃端口转发：
@@ -84,10 +84,10 @@ rm -rf "$ROOT"
 '
 ```
 
-Mixed/SOCKS5 curl 测试使用明文账号密码：
+Mixed/SOCKS5 curl 测试使用明文账号密码（用户名、密码、端口按菜单显示值替换）：
 
 ```bash
-curl -x 'socks5://daimon:daimon@IP:30000' https://ip.sb
+curl -x 'socks5://USER:PASS@IP:SOCKS_PORT' https://ip.sb
 ```
 
 ## 固定测试清单
@@ -97,7 +97,7 @@ curl -x 'socks5://daimon:daimon@IP:30000' https://ip.sb
 ```text
 1. 更新脚本
 3. 标准安装 Sing-box
-6. 一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls
+7. 一键添加协议：Mixed / Vless-reality / Vmess-ws / Hysteria-2 / Tuic-v5 / Anytls
 ```
 
 记录菜单里展示的 `IP`、`token`、各协议端口。下面示例变量按实际值替换：
@@ -106,7 +106,9 @@ curl -x 'socks5://daimon:daimon@IP:30000' https://ip.sb
 IP=162.141.137.231
 TOKEN=00060f83f401721e99f97ec32242c774
 SUB_PORT=2096
-SOCKS_PORT=30000
+SOCKS_PORT=<Mixed 端口>
+SOCKS_USER=<Mixed 用户名>
+SOCKS_PASS=<Mixed 密码>
 ```
 
 ### 1. VPS 服务器测试
@@ -119,8 +121,8 @@ systemctl is-active sing-box
 systemctl is-active sing-box-sub
 /etc/sing-box/bin/sing-box check -C /etc/sing-box/conf
 curl -fsS "http://127.0.0.1:${SUB_PORT}/sub/${TOKEN}/clash" | head -n 30
-curl -4 --max-time 15 -x "socks5://daimon:daimon@127.0.0.1:${SOCKS_PORT}" https://ip.sb
-ss -lntup | grep -E 'sing-box|python|:2096|:30000'
+curl -4 --max-time 15 -x "socks5://${SOCKS_USER}:${SOCKS_PASS}@127.0.0.1:${SOCKS_PORT}" https://ip.sb
+ss -lntup | grep -E "sing-box|python|:2096|:${SOCKS_PORT}"
 ufw status
 ```
 
@@ -132,7 +134,7 @@ ufw status
 - SOCKS5 curl 返回服务器出口 IP
 - UFW inactive 时无需放行；UFW active 时状态页不能出现缺失端口
 
-HTTPS 订阅域名测试。先在菜单 `11. 更改综合订阅链接配置` 里选择 `3. 设置/更改 HTTPS 订阅域名`，输入已解析到本机 IP 的域名，例如：
+HTTPS 订阅域名测试。先在菜单 `13. 更改综合订阅链接配置` 里选择 `3. 设置/更改 HTTPS 订阅域名`，输入已解析到本机 IP 的域名，例如：
 
 ```text
 sing-box-hk.333186.xyz
@@ -164,14 +166,16 @@ Windows PowerShell：
 
 ```powershell
 $IP = "162.141.137.231"
-$SOCKS_PORT = 30000
-curl.exe -4 --connect-timeout 8 --max-time 20 -x "socks5://daimon:daimon@${IP}:${SOCKS_PORT}" https://ip.sb
+$SOCKS_PORT = "<Mixed 端口>"
+$SOCKS_USER = "<Mixed 用户名>"
+$SOCKS_PASS = "<Mixed 密码>"
+curl.exe -4 --connect-timeout 8 --max-time 20 -x "socks5://${SOCKS_USER}:${SOCKS_PASS}@${IP}:${SOCKS_PORT}" https://ip.sb
 ```
 
 通过标准：输出为服务器 IP。不要使用 `socks://base64账号密码@IP:端口` 测 curl；脚本生成的 SOCKS5 明文链接是：
 
 ```text
-socks5://daimon:daimon@IP:30000#Mixed-SOCKS5
+socks5://用户名:密码@IP:端口#Mixed-SOCKS5
 ```
 
 ### 3. 本地 Clash / Mihomo 订阅与节点测试
@@ -277,7 +281,7 @@ D:\v2rayN-windows-64\bin\sing_box\sing-box.exe version
 
 ## 订阅形式
 
-标准模式的订阅服务默认端口为 `2096`，token 随机生成且只包含字母和数字。可以在菜单 `11. 更改综合订阅链接配置` 中修改订阅端口、指定 token 或回车随机重生成 token。NAT 轻量模式不启动订阅服务。
+标准模式的订阅服务默认端口为 `2096`，token 随机生成且只包含字母和数字。可以在菜单 `13. 更改综合订阅链接配置` 中修改订阅端口、指定 token 或回车随机重生成 token。NAT 轻量模式不启动订阅服务。
 
 ```text
 http://IP:2096/sub/token          # 默认订阅：v2rayN Base64
@@ -348,8 +352,8 @@ http://IP:2096/sub/token/mihomo
 - 查看协议时只读取并显示节点信息，不会重建配置或改动防火墙
 - 查看协议时显示每个节点的单行链接、二维码和综合订阅链接
 - 删除协议支持多选和一键删除所有协议
-- Mixed/SOCKS5 默认账号密码：`daimon` / `daimon`
-- Mixed/SOCKS5 默认端口从 `30000` 开始，其余协议默认随机使用高位端口
+- Mixed/SOCKS5 默认随机生成端口、用户名和密码，不同服务器之间不共用；其余协议同样默认随机使用高位端口
+- SOCKS5 是明文协议，容易被主动探测识别，不建议长期暴露在公网
 - SOCKS5 分享链接使用明文 `用户名:密码`
 - Reality SNI 随机使用 `www.bing.com`、`www.amazon.com`、`www.apple.com`，并支持自定义
 - Hysteria2 支持 UDP 跳跃端口转发；TUIC 不再提供半实现跳跃端口入口

@@ -52,4 +52,11 @@ output="$(printf '0\n' | main_menu)"
 ! grep -Fq '一键添加协议' <<<"$output" || exit 1
 grep -Fq 'NAT' <<<"$output"
 
+# Standard mode lists every main-menu entry, numbered 0-15 in display order.
+is_alpine() { return 1; }
+has_cmd() { return 0; }
+output="$(printf '0\n' | main_menu | sed 's/\x1b\[[0-9;]*m//g')"
+numbers="$(grep -oE '^ ?[0-9]+\.' <<<"$output" | tr -d ' .' | paste -sd ' ')"
+[[ "$numbers" == "0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15" ]] || { printf 'main menu order: %s\n' "$numbers" >&2; exit 1; }
+
 printf 'INTERACTION_MENUS_TEST=PASS\n'

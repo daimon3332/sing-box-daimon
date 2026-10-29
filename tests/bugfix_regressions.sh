@@ -160,4 +160,14 @@ touch -d '10 minutes ago' "$lock"
 acquire_async_lock "$lock"
 ! acquire_async_lock "$lock" || exit 1
 
+# One-click Mixed gets a random port and credentials, not a fleet-wide default.
+(
+  printf '%s\n' '{"token":"t0","install_mode":"standard","sub_tls":false,"protocols":{}}' >"$STATE"
+  reality_keypair() { printf 'priv\npub\n'; }
+  add_missing_protocols
+  [[ "$(proto_value mixed port)" != 30000 ]]
+  [[ "$(proto_value mixed username)" =~ ^[0-9a-f]{8}$ ]]
+  [[ "$(proto_value mixed password)" =~ ^[0-9a-f]{24}$ ]]
+)
+
 printf 'BUGFIX_REGRESSIONS_TEST=PASS\n'

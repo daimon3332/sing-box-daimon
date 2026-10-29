@@ -33,8 +33,8 @@ MENU_CANCELLED=false
 # Hidden main-menu entries are not selectable.
 is_alpine() { return 1; }
 lite_mode() { return 0; }
-main_menu_item_hidden 6
-! main_menu_item_hidden 7 || exit 1
+main_menu_item_hidden 7
+! main_menu_item_hidden 8 || exit 1
 
 # Updating to an identical script changes nothing.
 ROOT="$CASE_ROOT/root"

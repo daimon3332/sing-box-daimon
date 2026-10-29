@@ -96,6 +96,8 @@ public_ipv4() { return 1; }
 PUBLIC_IPS_DETECTED=false
 generate_subscription
 [[ "$(wc -l <"$SUB/raw.txt")" == 6 ]]
+# Without a hop range the Hysteria-2 link carries no hop_interval.
+! grep -q hop_interval "$SUB/raw.txt" || exit 1
 INPUTS=(1 3)
 choose_node_ip_version "仅 IPv6" >/dev/null
 [[ "$SELECTED_IP_VERSION" == ipv6 ]]
