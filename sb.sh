@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.2"
+SCRIPT_VERSION="1.14.3"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -4974,6 +4974,10 @@ CDN_ASNS = {13335, 209242, 20940, 16625, 16702, 18680, 18717, 21342, 21357, 2139
             33438, 22822, 15133, 200325, 57724, 200449, 205585}
 CLOUD_ASNS = {16509, 14618, 8987, 15169, 396982, 19527, 8075, 31898, 14061, 24940, 16276, 20473, 63949, 45102, 132203, 906}
 SHARED_NETS = [ipaddress.ip_network(n) for n in ("35.185.44.232/32", "23.185.0.0/24", "185.199.108.0/22", "75.2.60.5/32", "99.83.190.102/32")]
+# Hosted site platforms: anyone can publish under these, so they are never candidates.
+PLATFORM_DOMAIN = re.compile(r"(^|\.)(blogspot\.com|blogger\.com|wordpress\.com|wixsite\.com|weebly\.com|squarespace\.com|github\.io|gitlab\.io|netlify\.app|vercel\.app|pages\.dev|web\.app|firebaseapp\.com|herokuapp\.com|sites\.google\.com|google\.com|tumblr\.com|webnode\.[a-z]+|jimdo\.com|jimdofree\.com|strikingly\.com)$")
+# The site sits on the institution's own or a research-and-education network.
+ACADEMIC_HOLDER = re.compile(r"univ|college|school|institut|academ|education|research|polytech|campus|\bedu\b|sinet|internet2|janet|aarnet|kreonet|cernet|tanet|myren|singaren|geant|renater|dfn|surf|garr|rediris|canarie|tein|harnet|thairen|inherent|pern|ernet|nren", re.I)
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -5017,7 +5021,7 @@ def candidates(data, country):
             continue
         for dom in (uni.get("domains") or [])[:2]:
             dom = str(dom).strip().lower().rstrip(".")
-            if not DOMAIN_RE.match(dom):
+            if not DOMAIN_RE.match(dom) or PLATFORM_DOMAIN.search(dom):
                 continue
             out += [dom] if dom.startswith("www.") else ["www." + dom, dom]
     return list(dict.fromkeys(out))
@@ -5123,6 +5127,8 @@ def full_check(item, vps_asn, shared=frozenset()):
         flags.append("云托管")
     if ip in shared:
         flags.append("共享主机")
+    if asn not in CLOUD_ASNS and ACADEMIC_HOLDER.search(holder):
+        flags.append("院校网络")
     return {"host": host, "ip": ip, "tcp": tcp_ms, "tls": res[1], "asn": asn, "holder": holder, "flags": ",".join(flags)}
 
 def rank(results, top):
@@ -5156,6 +5162,10 @@ def selftest():
     assert classify_headers("HTTP/2 200\r\nset-cookie: visid_incap_823419=abc; HttpOnly\r\n")
     assert not classify_headers("HTTP/2 200\r\nserver: nginx\r\ncontent-type: text/html\r\nset-cookie: PHPSESSID=1\r\n")
     assert 19551 in CDN_ASNS and 13335 in CDN_ASNS
+    plat = [{"alpha_two_code": "MY", "domains": ["kidu-darululum.blogspot.com"]}, {"alpha_two_code": "MY", "domains": ["x.github.io", "uniten.edu.my"]}]
+    assert candidates(plat, "MY") == ["www.uniten.edu.my", "uniten.edu.my"], candidates(plat, "MY")
+    assert ACADEMIC_HOLDER.search("UNITEN-AS-AP - UNIVERSITI TENAGA NASIONAL") and ACADEMIC_HOLDER.search("SINET - Research Organization of Information and Systems")
+    assert not ACADEMIC_HOLDER.search("STSB-AS-AP - Serverfreak Technologies") and not ACADEMIC_HOLDER.search("CPI-NET - KDDI Web Communications Inc.")
     assert CDN_CNAME.search("e1.a.akamaiedge.net. www.x.edu.cdn.cloudflare.net.") and CDN_CNAME.search("nersc.gitlab.io.")
     assert not CDN_CNAME.search("web.cs.jhu.edu.")
     assert in_shared_net("35.185.44.232") and in_shared_net("23.185.0.4") and not in_shared_net("128.8.127.4")
@@ -5242,7 +5252,7 @@ pick_scanned_reality_sni() {
     i=$((i + 1))
     printf '%-4s %-36s %7sms %7sms  AS%s %s%s\n' "$i." "$d" "$tcp" "$tls" "$asn" "$holder" "${flags:+  [$flags]}" >&2
   done
-  printf '同ASN = 与本机同一 ASN；云托管 = 托管在云厂商；共享主机 = 同一 IP 上有多个不同网站。后两种请自行确认不是多租户共享入口。\n' >&2
+  printf '同ASN = 与本机同一 ASN；院校网络 = 在学校自有网络或教育科研网上（优先选择）；云托管 = 托管在云厂商；共享主机 = 同一 IP 上有多个不同网站。后两种请自行确认不是多租户共享入口。\n' >&2
   choice="$(ask_menu "选择网站（0 返回）: " "${#rows[@]}")"
   [[ "$choice" != 0 ]] || { menu_cancel; return 1; }
   cut -f1 <<<"${rows[choice-1]}"
