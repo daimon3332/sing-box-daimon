@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.3"
+SCRIPT_VERSION="1.14.4"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -5138,6 +5138,12 @@ def rank(results, top):
             continue
         seen.add(r.get("ip"))
         out.append(r)
+    # Sites on an academic network go first when they are at most 30 ms slower
+    # than the fastest one, so the short list shows them instead of web hosts.
+    if out:
+        best = out[0]["tls"]
+        first = [r for r in out if "院校网络" in r.get("flags", "") and r["tls"] <= best + 30]
+        out = first + [r for r in out if r not in first]
     return out[:top]
 
 def selftest():
@@ -5172,6 +5178,10 @@ def selftest():
     r = rank([{"tls": 50.0, "tcp": 3.0, "host": "b", "ip": "2"}, None, {"tls": 20.0, "tcp": 9.0, "host": "a", "ip": "1"},
               {"tls": 30.0, "tcp": 1.0, "host": "www.a", "ip": "1"}], 10)
     assert [x["host"] for x in r] == ["a", "b"], r
+    r = rank([{"tls": 50.0, "tcp": 1, "host": "fast", "ip": "1", "flags": ""},
+              {"tls": 70.0, "tcp": 1, "host": "uni", "ip": "2", "flags": "院校网络"},
+              {"tls": 95.0, "tcp": 1, "host": "far-uni", "ip": "3", "flags": "院校网络"}], 10)
+    assert [x["host"] for x in r] == ["uni", "fast", "far-uni"], r
     assert shared_ips([("www.x.jp", "1", 1), ("x.jp", "1", 1), ("www.y.jp", "2", 1), ("z.jp", "2", 1)]) == {"2"}
     print("REALITY_FINDER_SELFTEST=PASS")
 

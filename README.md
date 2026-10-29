@@ -41,7 +41,7 @@ NAT 模式会先检查必需命令，依赖齐全时完全跳过包管理器。�
 - 同一菜单的 HTTP/IP 订阅下载地址与节点连接地址相互独立。Alpine/NAT 模式不提供 HTTP/HTTPS 订阅，但保留节点地址管理。
 - 菜单 `11. 一键更换协议端口`：可选全部协议或多选指定协议，随机生成 20000–60000 的新端口，自动避开已占用端口、其他协议端口、Hysteria-2 跳跃范围和历史端口；确认前列出“旧端口 -> 新端口”，所有选中协议在同一次变更中生效，同时更新 UFW 规则、跳跃端口转发和订阅。需要指定端口请用菜单 `9` 修改协议。
 - 更换过的旧端口记录在 `/etc/sing-box/port-history`（最近 200 条），可在菜单 `11` 中查看；菜单 `9` 手动改端口时旧端口同样记入历史，填写历史端口会给出提示。NAT 模式更换后需在服务商面板更新端口映射。
-- 菜单 `16. 查找 REALITY 目标网站`（仅标准模式）：从公开的 [Hipo university-domains-list](https://github.com/Hipo/university-domains-list)（MIT 协议，本地缓存 7 天）中取本机所在国家的高校网站。先在本机测 443 端口的 TCP 延迟，取最近的 100 个，再逐个检测 TLS1.3、h2、X25519、证书有效、HTTP 200 无跳转、不在 CDN/共享托管上（检查 CNAME、响应头和 ASN），最后按本机测得的 TLS 握手延迟排序，列出前 10 个，并标注 ASN、同 ASN、院校网络（学校自有网络或教育科研网，优先选择）、云托管、共享主机；blogspot、github.io 等任何人都能发布内容的托管平台域名会直接排除。选中后会把 Vless-reality 的 SNI 和 target 改为该网站。检测时会访问 GitHub、dns.google、cloudflare-dns.com 和 RIPEstat。
+- 菜单 `16. 查找 REALITY 目标网站`（仅标准模式）：从公开的 [Hipo university-domains-list](https://github.com/Hipo/university-domains-list)（MIT 协议，本地缓存 7 天）中取本机所在国家的高校网站。先在本机测 443 端口的 TCP 延迟，取最近的 100 个，再逐个检测 TLS1.3、h2、X25519、证书有效、HTTP 200 无跳转、不在 CDN/共享托管上（检查 CNAME、响应头和 ASN），最后按本机测得的 TLS 握手延迟排序（院校网络上的网站只要不比最快的慢 30ms 以上就排在前面），列出前 10 个，并标注 ASN、同 ASN、院校网络（学校自有网络或教育科研网，优先选择）、云托管、共享主机；blogspot、github.io 等任何人都能发布内容的托管平台域名会直接排除。选中后会把 Vless-reality 的 SNI 和 target 改为该网站。检测时会访问 GitHub、dns.google、cloudflare-dns.com 和 RIPEstat。
 - `0` 返回上级菜单；输入结束（Ctrl-D）取消当前输入，不自动接受修改。节点变更先生成并检查配置，生成或校验失败时不发布。
 
 手动彻底删除脚本、sing-box、节点、订阅服务、脚本托管的 UFW 规则和跳跃端口转发：
