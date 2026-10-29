@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.6"
+SCRIPT_VERSION="1.14.7"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -4973,7 +4973,9 @@ CDN_ASNS = {13335, 209242, 20940, 16625, 16702, 18680, 18717, 21342, 21357, 2139
             32787, 33905, 34164, 35204, 35993, 35994, 36183, 54113, 19551, 62571, 60068, 199524, 202422, 202623, 30148, 12989, 20446,
             33438, 22822, 15133, 200325, 57724, 200449, 205585,
             # Multi-tenant site platforms: WordPress VIP (Automattic), Squarespace, Wix, Shopify, GitHub Pages.
-            2635, 53831, 58182, 62679, 36459}
+            2635, 53831, 58182, 62679, 36459,
+            # F5 Distributed Cloud (Volterra) edge.
+            35280}
 CLOUD_ASNS = {16509, 14618, 8987, 15169, 396982, 19527, 8075, 31898, 14061, 24940, 16276, 20473, 63949, 45102, 132203, 906}
 SHARED_NETS = [ipaddress.ip_network(n) for n in ("35.185.44.232/32", "23.185.0.0/24", "185.199.108.0/22", "75.2.60.5/32", "99.83.190.102/32")]
 # Hosted site platforms: anyone can publish under these, so they are never candidates.
@@ -5111,6 +5113,14 @@ def http_check(host):
 def classify_headers(headers):
     return bool(CDN_HEADER.search(headers.replace("\r", "")))
 
+# Department and mirror hosts often sit on the campus network even when the
+# main site is behind a CDN or in a cloud.
+VARIANT_PREFIXES = ("cs.", "www.cs.", "mirror.", "mirrors.")
+
+def variants(hosts):
+    bases = list(dict.fromkeys(h[4:] if h.startswith("www.") else h for h in hosts))
+    return [p + b for b in bases for p in VARIANT_PREFIXES]
+
 def shared_ips(reach):
     sites = {}
     for host, ip, _ in reach:
@@ -5178,7 +5188,9 @@ def selftest():
     assert classify_headers("HTTP/2 200\r\nx-iinfo: 51-1 0NNN\r\n")
     assert classify_headers("HTTP/2 200\r\nset-cookie: visid_incap_823419=abc; HttpOnly\r\n")
     assert not classify_headers("HTTP/2 200\r\nserver: nginx\r\ncontent-type: text/html\r\nset-cookie: PHPSESSID=1\r\n")
-    assert 19551 in CDN_ASNS and 13335 in CDN_ASNS and 2635 in CDN_ASNS
+    assert 19551 in CDN_ASNS and 13335 in CDN_ASNS and 2635 in CDN_ASNS and 35280 in CDN_ASNS
+    assert variants(["www.umd.edu", "umd.edu", "jhu.edu"]) == ["cs.umd.edu", "www.cs.umd.edu", "mirror.umd.edu", "mirrors.umd.edu",
+                                                              "cs.jhu.edu", "www.cs.jhu.edu", "mirror.jhu.edu", "mirrors.jhu.edu"]
     plat = [{"alpha_two_code": "MY", "domains": ["kidu-darululum.blogspot.com"]}, {"alpha_two_code": "MY", "domains": ["x.github.io", "uniten.edu.my"]}]
     assert candidates(plat, "MY") == ["www.uniten.edu.my", "uniten.edu.my"], candidates(plat, "MY")
     assert ACADEMIC_HOLDER.search("UNITEN-AS-AP - UNIVERSITI TENAGA NASIONAL") and ACADEMIC_HOLDER.search("SINET - Research Organization of Information and Systems")
@@ -5205,6 +5217,7 @@ def main():
     ap.add_argument("--cache", default="/tmp/universities.json")
     ap.add_argument("--max-age", type=float, default=7)
     ap.add_argument("--keep", type=int, default=100)
+    ap.add_argument("--variant-bases", type=int, default=300)
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--vps-ip", default="")
     ap.add_argument("--selftest", action="store_true")
@@ -5229,8 +5242,10 @@ def main():
     if not cands:
         return
     with cf.ThreadPoolExecutor(64) as ex:
-        reach = sorted((r for r in ex.map(tcp_probe, cands) if r), key=lambda r: r[2])[:a.keep]
-    log(f"{len(reach)} reachable on 443, checking the nearest")
+        reach_all = sorted((r for r in ex.map(tcp_probe, cands) if r), key=lambda r: r[2])
+        extra = [r for r in ex.map(tcp_probe, variants([h for h, _, _ in reach_all[:a.variant_bases]])) if r]
+    reach = reach_all[:a.keep] + extra
+    log(f"{len(reach_all)} reachable on 443, checking the nearest {min(len(reach_all), a.keep)} and {len(extra)} department/mirror hosts")
     vps_asn = asn_of(a.vps_ip)[0] if a.vps_ip else 0
     shared = shared_ips(reach)
     with cf.ThreadPoolExecutor(16) as ex:
