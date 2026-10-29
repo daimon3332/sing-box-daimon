@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.4"
+SCRIPT_VERSION="1.14.5"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -4977,7 +4977,8 @@ SHARED_NETS = [ipaddress.ip_network(n) for n in ("35.185.44.232/32", "23.185.0.0
 # Hosted site platforms: anyone can publish under these, so they are never candidates.
 PLATFORM_DOMAIN = re.compile(r"(^|\.)(blogspot\.com|blogger\.com|wordpress\.com|wixsite\.com|weebly\.com|squarespace\.com|github\.io|gitlab\.io|netlify\.app|vercel\.app|pages\.dev|web\.app|firebaseapp\.com|herokuapp\.com|sites\.google\.com|google\.com|tumblr\.com|webnode\.[a-z]+|jimdo\.com|jimdofree\.com|strikingly\.com)$")
 # The site sits on the institution's own or a research-and-education network.
-ACADEMIC_HOLDER = re.compile(r"univ|college|school|institut|academ|education|research|polytech|campus|\bedu\b|sinet|internet2|janet|aarnet|kreonet|cernet|tanet|myren|singaren|geant|renater|dfn|surf|garr|rediris|canarie|tein|harnet|thairen|inherent|pern|ernet|nren", re.I)
+# Network names are whole words: "ERNET" must not match "Internet".
+ACADEMIC_HOLDER = re.compile(r"univ|college|school|institut|academ|education|research|polytech|campus|\b(edu|sinet|internet2|janet|aarnet|kreonet2?|cernet2?|tanet|myren|singaren|geant|renater|dfn|surfnet|garr|rediris|canarie|tein\d*|harnet|thairen|inherent|pern|ernet|nren)\b", re.I)
 
 def log(msg):
     print(msg, file=sys.stderr, flush=True)
@@ -5172,6 +5173,9 @@ def selftest():
     assert candidates(plat, "MY") == ["www.uniten.edu.my", "uniten.edu.my"], candidates(plat, "MY")
     assert ACADEMIC_HOLDER.search("UNITEN-AS-AP - UNIVERSITI TENAGA NASIONAL") and ACADEMIC_HOLDER.search("SINET - Research Organization of Information and Systems")
     assert not ACADEMIC_HOLDER.search("STSB-AS-AP - Serverfreak Technologies") and not ACADEMIC_HOLDER.search("CPI-NET - KDDI Web Communications Inc.")
+    for host_net in ("SAKURA-F - SAKURA Internet Inc.", "GMO-I-R1 - GMO Internet, Inc.", "EXABYTES-AS-AP - Exa Bytes Network", "KEP-AS-KR-KR - KAKAO Enterprise"):
+        assert not ACADEMIC_HOLDER.search(host_net), host_net
+    assert ACADEMIC_HOLDER.search("ERNET-AS-AP ERNET India") and ACADEMIC_HOLDER.search("KREONET2") and ACADEMIC_HOLDER.search("TEIN2-AP")
     assert CDN_CNAME.search("e1.a.akamaiedge.net. www.x.edu.cdn.cloudflare.net.") and CDN_CNAME.search("nersc.gitlab.io.")
     assert not CDN_CNAME.search("web.cs.jhu.edu.")
     assert in_shared_net("35.185.44.232") and in_shared_net("23.185.0.4") and not in_shared_net("128.8.127.4")
