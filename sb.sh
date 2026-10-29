@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.8"
+SCRIPT_VERSION="1.14.9"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -5144,11 +5144,12 @@ def full_check(item, vps_asn, shared=frozenset()):
     flags = []
     if vps_asn and asn == vps_asn:
         flags.append("同ASN")
-    if asn in CLOUD_ASNS:
+    cloud = asn in CLOUD_ASNS or bool(re.search(r"cloud", holder, re.I))
+    if cloud:
         flags.append("云托管")
     if ip in shared:
         flags.append("共享主机")
-    if asn not in CLOUD_ASNS and ACADEMIC_HOLDER.search(holder):
+    if not cloud and ACADEMIC_HOLDER.search(holder):
         flags.append("院校网络")
     return {"host": host, "ip": ip, "tcp": tcp_ms, "tls": res[1], "asn": asn, "holder": holder, "flags": ",".join(flags)}
 

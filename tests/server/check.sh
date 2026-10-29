@@ -27,7 +27,7 @@ echo "== $(hostname) $(. /etc/os-release; echo "$PRETTY_NAME") alpine=$alpine ==
 
 check "script syntax" bash -n "$SCRIPT"
 ver="$(sed -n 's/^SCRIPT_VERSION="\([^"]*\)".*/\1/p' "$SCRIPT")"
-[[ "$ver" == 1.14.8 ]] && ok "script version $ver" || bad "script version is '$ver', expected 1.14.1"
+[[ "$ver" == 1.14.9 ]] && ok "script version $ver" || bad "script version is '$ver', expected 1.14.1"
 ! grep -q 'network_tools_menu\|99-zz-sing-box-daimon' "$SCRIPT" && ok "network tuning removed" || bad "network tuning code still present"
 [[ -s "$STATE" ]] || { bad "no $STATE — install first"; echo "PASS=$PASS FAIL=$FAIL"; exit 1; }
 
