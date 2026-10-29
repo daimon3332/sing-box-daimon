@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.1"
+SCRIPT_VERSION="1.14.2"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -4967,8 +4967,11 @@ import argparse, concurrent.futures as cf, ipaddress, json, os, re, socket, subp
 DATASET_URL = "https://raw.githubusercontent.com/Hipo/university-domains-list/master/world_universities_and_domains.json"
 DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
 CDN_CNAME = re.compile(r"cloudflare|akamai|edgekey|edgesuite|cloudfront|fastly|gitlab\.io|github\.io|pantheon|netlify|vercel|azurefd|azureedge|trafficmanager|sucuri|wpengine|squarespace|wixdns|incapdns|impervadns|b-cdn|cdn77|gcorelabs|kxcdn|stackpathdns|myshopify", re.I)
-CDN_HEADER = re.compile(r"^(cf-ray|x-amz-cf-id|x-amz-cf-pop|x-pantheon-[\w-]+|x-served-by|x-sucuri-[\w-]+|x-akamai-[\w-]+|x-fastly-[\w-]+|x-vercel-[\w-]+|x-nf-request-id|x-azure-ref|x-github-request-id|x-gitlab-[\w-]+)\s*:|^via\s*:.*(varnish|cloudfront|akamai)|^server\s*:\s*(cloudflare|sucuri|akamaighost|netlify|vercel|github\.com)", re.I | re.M)
-CDN_ASNS = {13335, 209242, 20940, 16625, 16702, 54113, 60068, 199524, 202623, 30148}
+CDN_HEADER = re.compile(r"^(cf-ray|x-amz-cf-id|x-amz-cf-pop|x-pantheon-[\w-]+|x-served-by|x-sucuri-[\w-]+|x-akamai-[\w-]+|x-fastly-[\w-]+|x-vercel-[\w-]+|x-nf-request-id|x-azure-ref|x-github-request-id|x-gitlab-[\w-]+|x-iinfo|x-cdn|x-edgeconnect-[\w-]+|cdn-cache|x-bunny-[\w-]+|x-77-[\w-]+)\s*:|^via\s*:.*(varnish|cloudfront|akamai)|^server\s*:\s*(cloudflare|sucuri|akamaighost|netlify|vercel|github\.com|imperva|ddos-guard|bunnycdn|cdn77)|^set-cookie\s*:\s*(visid_incap|incap_ses|__cf_bm|ak_bmsc|bm_sv|__ddg)", re.I | re.M)
+# CDN / WAF networks: every customer shares the same edge, so they are never used.
+CDN_ASNS = {13335, 209242, 20940, 16625, 16702, 18680, 18717, 21342, 21357, 21399, 23454, 23455, 24319, 31107, 31108, 31109, 31110,
+            32787, 33905, 34164, 35204, 35993, 35994, 36183, 54113, 19551, 62571, 60068, 199524, 202422, 202623, 30148, 12989, 20446,
+            33438, 22822, 15133, 200325, 57724, 200449, 205585}
 CLOUD_ASNS = {16509, 14618, 8987, 15169, 396982, 19527, 8075, 31898, 14061, 24940, 16276, 20473, 63949, 45102, 132203, 906}
 SHARED_NETS = [ipaddress.ip_network(n) for n in ("35.185.44.232/32", "23.185.0.0/24", "185.199.108.0/22", "75.2.60.5/32", "99.83.190.102/32")]
 
@@ -5149,7 +5152,10 @@ def selftest():
     assert classify_headers("HTTP/2 200\r\ncf-ray: 1-SIN\r\n")
     assert classify_headers("HTTP/2 200\r\nvia: 1.1 varnish\r\n")
     assert classify_headers("HTTP/2 200\r\nx-pantheon-styx-hostname: a\r\n")
-    assert not classify_headers("HTTP/2 200\r\nserver: nginx\r\ncontent-type: text/html\r\n")
+    assert classify_headers("HTTP/2 200\r\nx-iinfo: 51-1 0NNN\r\n")
+    assert classify_headers("HTTP/2 200\r\nset-cookie: visid_incap_823419=abc; HttpOnly\r\n")
+    assert not classify_headers("HTTP/2 200\r\nserver: nginx\r\ncontent-type: text/html\r\nset-cookie: PHPSESSID=1\r\n")
+    assert 19551 in CDN_ASNS and 13335 in CDN_ASNS
     assert CDN_CNAME.search("e1.a.akamaiedge.net. www.x.edu.cdn.cloudflare.net.") and CDN_CNAME.search("nersc.gitlab.io.")
     assert not CDN_CNAME.search("web.cs.jhu.edu.")
     assert in_shared_net("35.185.44.232") and in_shared_net("23.185.0.4") and not in_shared_net("128.8.127.4")
