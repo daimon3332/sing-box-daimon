@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.14.7"
+SCRIPT_VERSION="1.14.8"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -5217,7 +5217,7 @@ def main():
     ap.add_argument("--cache", default="/tmp/universities.json")
     ap.add_argument("--max-age", type=float, default=7)
     ap.add_argument("--keep", type=int, default=100)
-    ap.add_argument("--variant-bases", type=int, default=300)
+    ap.add_argument("--variant-bases", type=int, default=1500)
     ap.add_argument("--top", type=int, default=10)
     ap.add_argument("--vps-ip", default="")
     ap.add_argument("--selftest", action="store_true")
@@ -5281,7 +5281,7 @@ pick_scanned_reality_sni() {
   input="${input^^}"
   [[ "$input" =~ ^[A-Z]{2}$ ]] || { warn "国家代码格式错误。" >&2; return 1; }
   mkdir -p "$ROOT/cache" || return 1
-  info "正在检测 $input 的候选网站，通常需要 15-60 秒..." >&2
+  info "正在检测 $input 的候选网站，通常需要 15-90 秒..." >&2
   out="$(reality_finder --country "$input" --cache "$ROOT/cache/universities.json" --vps-ip "$(public_ipv4 2>/dev/null || true)")" || { fail "查找失败：数据集下载或检测出错。" >&2; return 1; }
   mapfile -t rows < <(printf '%s\n' "$out" | sed '/^$/d')
   ((${#rows[@]})) || { warn "没有找到符合条件的网站，可换一个国家代码，或手动输入。" >&2; return 1; }
@@ -5303,7 +5303,7 @@ choose_reality_sni() {
   local choice sni target scan=false
   reality_scan_available && scan=true
   printf 'Vless-reality SNI：\n1. 随机（%s）\n' "${SNI_OPTIONS[*]}" >&2
-  [[ "$scan" == true ]] && printf '2. 扫描本机所在地区的高校网站（约 15-60 秒）\n' >&2
+  [[ "$scan" == true ]] && printf '2. 扫描本机所在地区的高校网站（约 15-90 秒）\n' >&2
   printf '3. 自定义 SNI 和 target\n0. 返回\n' >&2
   while true; do
     choice="$(ask_menu "请选择 [回车=1]: " 3 1)"
