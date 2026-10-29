@@ -3,7 +3,7 @@ set -Eeuo pipefail
 umask 077
 
 ROOT="/etc/sing-box"
-SCRIPT_VERSION="1.13.0"
+SCRIPT_VERSION="1.14.0"
 SCRIPT_SOURCE="${BASH_SOURCE[0]}"
 SCRIPT_URL="https://raw.githubusercontent.com/daimon3332/sing-box-daimon/main/sb.sh"
 BIN="$ROOT/bin/sing-box"
@@ -1373,6 +1373,62 @@ random_sni() {
   printf '%s' "${SNI_OPTIONS[$((RANDOM % ${#SNI_OPTIONS[@]}))]}"
 }
 
+# "host:port" or "[ipv6]:port" -> "host<TAB>port".
+split_reality_target() {
+  local target="$1" host port
+  if [[ "$target" =~ ^\[([0-9A-Fa-f:.]+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}" port="${BASH_REMATCH[2]}"
+    valid_ip_address "$host" 6 || return 1
+  elif [[ "$target" =~ ^([^:]+):([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}" port="${BASH_REMATCH[2]}"
+    valid_domain "$host" || valid_ip_address "$host" 4 || return 1
+  else
+    return 1
+  fi
+  valid_port "$port" || return 1
+  printf '%s\t%s' "$host" "$port"
+}
+
+# An empty target follows the SNI, so changing the SNI keeps working as before.
+reality_target_value() {
+  local target
+  target="$(proto_value vless_reality target "")"
+  [[ -n "$target" ]] || target="$(proto_value vless_reality sni "${SNI_OPTIONS[0]}"):443"
+  printf '%s' "$target"
+}
+
+reality_target_state_value() {
+  [[ "$2" == "$1:443" ]] || printf '%s' "$2"
+}
+
+ask_reality_target() {
+  local sni="$1" current="${2:-}" input
+  current="${current:-$sni:443}"
+  while true; do
+    safe_read "Reality target（握手目标 域名:端口）[$current]: " input || return 1
+    input="${input:-$current}"
+    split_reality_target "$input" >/dev/null && { printf '%s' "$input"; return 0; }
+    warn "target 格式应为 域名:端口 或 [IPv6]:端口。" >&2
+  done
+}
+
+# The handshake is borrowed from the target, so it must speak TLS 1.3 + h2 +
+# X25519 for the SNI; otherwise clients fail with "target sent incorrect server hello".
+reality_target_usable() {
+  local sni="$1" host port out
+  IFS=$'\t' read -r host port <<<"$(split_reality_target "$2")" || return 1
+  [[ -n "$host" ]] || return 1
+  has_cmd openssl || return 0
+  out="$(timeout 10 openssl s_client -connect "$host:$port" -servername "$sni" -tls1_3 -groups X25519 -alpn h2 </dev/null 2>/dev/null || true)"
+  grep -q 'TLSv1.3' <<<"$out" && grep -q 'ALPN protocol: h2' <<<"$out"
+}
+
+confirm_reality_target() {
+  reality_target_usable "$1" "$2" && return 0
+  warn "target $2 未通过 TLS1.3 + h2 + X25519 检测（SNI=$1），Reality 握手可能失败。" >&2
+  ask_yes_no "仍然使用该 target？" n
+}
+
 cert_names() {
   printf '%s\n' "${SNI_OPTIONS[@]}"
   [[ -s "$STATE" ]] && python3 - "$STATE" <<'PY' 2>/dev/null || true
@@ -1493,8 +1549,11 @@ EOF
 }
 
 write_vless_config() {
-  local port="$1" uuid="$2" sni="$3" private_key="$4" short_id="$5"
-  escape_config_values uuid sni private_key short_id || return 1
+  local port="$1" uuid="$2" sni="$3" private_key="$4" short_id="$5" target="${6:-}" target_host target_port
+  [[ -n "$target" ]] || target="$sni:443"
+  IFS=$'\t' read -r target_host target_port <<<"$(split_reality_target "$target")" || true
+  [[ -n "$target_host" && -n "$target_port" ]] || { fail "Reality target 格式错误：$target" >&2; return 1; }
+  escape_config_values uuid sni private_key short_id target_host || return 1
   cat >"$CONF/11_vless_reality.json" <<EOF || return 1
 {
   "inbounds": [
@@ -1516,8 +1575,8 @@ write_vless_config() {
         "reality": {
           "enabled": true,
           "handshake": {
-            "server": "$sni",
-            "server_port": 443
+            "server": "$target_host",
+            "server_port": $target_port
           },
           "private_key": "$private_key",
           "short_id": [
@@ -1858,7 +1917,7 @@ render_configs() {
     write_mixed_config "$(proto_value mixed port)" "$(proto_value mixed username daimon)" "$(proto_value mixed password daimon)" || return 1
   fi
   if [[ "$(proto_value vless_reality enabled false)" == "true" ]]; then
-    write_vless_config "$(proto_value vless_reality port)" "$(proto_value vless_reality uuid)" "$(proto_value vless_reality sni)" "$(proto_value vless_reality private_key)" "$(proto_value vless_reality short_id)" || return 1
+    write_vless_config "$(proto_value vless_reality port)" "$(proto_value vless_reality uuid)" "$(proto_value vless_reality sni)" "$(proto_value vless_reality private_key)" "$(proto_value vless_reality short_id)" "$(reality_target_value)" || return 1
   fi
   if [[ "$(proto_value vmess_ws enabled false)" == "true" ]]; then
     write_vmess_config "$(proto_value vmess_ws port)" "$(proto_value vmess_ws uuid)" "$(proto_value vmess_ws tls false)" || return 1
@@ -3827,12 +3886,13 @@ add_mixed() {
 }
 
 add_vless_reality() {
-  local port uuid sni short_id keys private_key public_key
+  local port uuid pair sni target short_id keys private_key public_key
   require_core_installed || return 1
   choose_node_ip_version "Vless-reality" || return 1
   port="$(ask_port "Vless-reality" "$(random_free_port)")" || return 1
   uuid="$(ask_text "Vless-reality UUID" "$(rand_uuid)")" || return 1
-  sni="$(pick_sni "$(random_sni)")" || return 1
+  pair="$(choose_reality_sni)" || return 1
+  IFS=$'\t' read -r sni target <<<"$pair"
   short_id="$(rand_hex 8)"
   keys="$(reality_keypair || true)"
   private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
@@ -3841,7 +3901,7 @@ add_vless_reality() {
     fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"
     return 1
   fi
-  apply_state_change config set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key" || return 1
+  apply_state_change config set_selected_protocol vless_reality "port=$port" "uuid=$uuid" "sni=$sni" "target=$target" "short_id=$short_id" "private_key=$private_key" "public_key=$public_key" || return 1
 }
 
 add_vmess_ws() {
@@ -3943,6 +4003,12 @@ add_all_protocols() {
     fi
   done
   [[ "$needs_ip" == "false" ]] || choose_node_ip_version "一键添加协议" || return 1
+  ONE_CLICK_REALITY_SNI="" ONE_CLICK_REALITY_TARGET=""
+  if ! protocol_exists vless_reality; then
+    local pair
+    pair="$(choose_reality_sni)" || return 1
+    IFS=$'\t' read -r ONE_CLICK_REALITY_SNI ONE_CLICK_REALITY_TARGET <<<"$pair"
+  fi
   apply_state_change config add_missing_protocols || return 1
   info "一键协议已生成。"
   show_protocol_details
@@ -3956,7 +4022,7 @@ add_missing_protocols() {
     private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
     public_key="$(printf '%s\n' "$keys" | sed -n '2p')"
     [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败，请确认 sing-box 内核可用。"; return 1; }
-    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=$(random_sni)" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key" || return 1
+    set_selected_protocol vless_reality "port=$(random_free_port)" "uuid=$(rand_uuid)" "sni=${ONE_CLICK_REALITY_SNI:-$(random_sni)}" "target=${ONE_CLICK_REALITY_TARGET:-}" "short_id=$(rand_hex 8)" "private_key=$private_key" "public_key=$public_key" || return 1
   }
   [[ "$(proto_value vmess_ws enabled false)" == "true" ]] || set_selected_protocol vmess_ws "port=$(random_free_port)" "uuid=$(rand_uuid)" "tls=false" || return 1
   [[ "$(proto_value hysteria2 enabled false)" == "true" ]] || set_selected_protocol hysteria2 "port=$(random_free_port)" "password=$(rand_uuid)" "sni=$(random_sni)" "hop_start=" "hop_end=" || return 1
@@ -4332,13 +4398,26 @@ change_protocol_config() {
       esac
       ;;
     vless_reality)
-      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 重新生成 Reality 密钥\n5. 修改客户端连接地址\n0. 返回\n"
-      field="$(ask_menu "请选择: " 5)" || return 1
+      printf "1. 修改端口\n2. 修改 UUID\n3. 修改 SNI\n4. 修改 target（当前：%s）\n5. 重新生成 Reality 密钥\n6. 修改客户端连接地址\n0. 返回\n" "$(reality_target_value)"
+      field="$(ask_menu "请选择: " 6)" || return 1
       case "$field" in
         1) change_protocol_port "$proto" "$label" || return 1 ;;
         2) value="$(ask_text "Vless-reality UUID" "$(proto_value vless_reality uuid)")" || return 1; apply_state_change config set_protocol vless_reality "uuid=$value" || return 1 ;;
-        3) value="$(pick_sni "$(proto_value vless_reality sni)")" || return 1; apply_state_change config set_protocol vless_reality "sni=$value" || return 1 ;;
+        3)
+          local target
+          value="$(pick_sni "$(proto_value vless_reality sni)")" || return 1
+          target="$(proto_value vless_reality target "")"
+          confirm_reality_target "$value" "${target:-$value:443}" || return 1
+          apply_state_change config set_protocol vless_reality "sni=$value" || return 1
+          ;;
         4)
+          local sni target
+          sni="$(proto_value vless_reality sni)"
+          target="$(ask_reality_target "$sni" "$(reality_target_value)")" || return 1
+          confirm_reality_target "$sni" "$target" || return 1
+          apply_state_change config set_protocol vless_reality "target=$(reality_target_state_value "$sni" "$target")" || return 1
+          ;;
+        5)
           local keys private_key public_key
           keys="$(reality_keypair || true)"
           private_key="$(printf '%s\n' "$keys" | sed -n '1p')"
@@ -4346,7 +4425,7 @@ change_protocol_config() {
           [[ -n "$private_key" && -n "$public_key" ]] || { fail "Reality 密钥生成失败。"; return 0; }
           apply_state_change config set_protocol vless_reality "private_key=$private_key" "public_key=$public_key" "short_id=$(rand_hex 8)" || return 1
           ;;
-        5) change_protocol_ip_version vless_reality "$label" || return 1 ;;
+        6) change_protocol_ip_version vless_reality "$label" || return 1 ;;
         0) menu_cancel ;;
       esac
       ;;
@@ -4755,7 +4834,7 @@ show_protocols() {
     return
   fi
   [[ "$(proto_value vless_reality enabled false)" == "true" ]] &&
-    printf "${YELLOW}【 %s 】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}Reality域名证书伪装地址:${NC}${MAGENTA}%s${NC}\n" "$(node_display_name vless_reality)" "$(proto_value vless_reality port)" "$(proto_ip_label vless_reality)" "$(proto_value vless_reality sni)"
+    printf "${YELLOW}【 %s 】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}Reality域名证书伪装地址:${NC}${MAGENTA}%s${NC}%s\n" "$(node_display_name vless_reality)" "$(proto_value vless_reality port)" "$(proto_ip_label vless_reality)" "$(proto_value vless_reality sni)" "$([[ -z "$(proto_value vless_reality target "")" ]] || printf '  target:%s' "$(proto_value vless_reality target)")"
   [[ "$(proto_value vmess_ws enabled false)" == "true" ]] &&
     printf "${YELLOW}【 %s 】${NC} ${CYAN}端口:${NC}${GREEN}%s${NC}  ${CYAN}节点IP:${NC}%s  ${CYAN}证书形式:${NC}%b\n" "$(node_display_name vmess_ws)" "$(proto_value vmess_ws port)" "$(proto_ip_label vmess_ws)" "$(color_status "$([[ "$(proto_value vmess_ws tls false)" == "true" ]] && printf '自签证书' || printf 'TLS关闭')")"
   if [[ "$(proto_value hysteria2 enabled false)" == "true" ]]; then
@@ -4877,10 +4956,336 @@ run_manage() {
   done
 }
 
+# Regional REALITY target finder. Candidates come from the public Hipo
+# university-domains-list (MIT); every check runs from this VPS, so the ranking
+# reflects the real network distance to the target. Prints TSV:
+# domain ip tcp_ms tls_ms asn holder flags
+reality_finder() {
+  python3 - "$@" <<'PY'
+import argparse, concurrent.futures as cf, ipaddress, json, os, re, socket, subprocess, sys, threading, time, urllib.request
+
+DATASET_URL = "https://raw.githubusercontent.com/Hipo/university-domains-list/master/world_universities_and_domains.json"
+DOMAIN_RE = re.compile(r"^(?=.{4,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$")
+CDN_CNAME = re.compile(r"cloudflare|akamai|edgekey|edgesuite|cloudfront|fastly|gitlab\.io|github\.io|pantheon|netlify|vercel|azurefd|azureedge|trafficmanager|sucuri|wpengine|squarespace|wixdns|incapdns|impervadns|b-cdn|cdn77|gcorelabs|kxcdn|stackpathdns|myshopify", re.I)
+CDN_HEADER = re.compile(r"^(cf-ray|x-amz-cf-id|x-amz-cf-pop|x-pantheon-[\w-]+|x-served-by|x-sucuri-[\w-]+|x-akamai-[\w-]+|x-fastly-[\w-]+|x-vercel-[\w-]+|x-nf-request-id|x-azure-ref|x-github-request-id|x-gitlab-[\w-]+)\s*:|^via\s*:.*(varnish|cloudfront|akamai)|^server\s*:\s*(cloudflare|sucuri|akamaighost|netlify|vercel|github\.com)", re.I | re.M)
+CDN_ASNS = {13335, 209242, 20940, 16625, 16702, 54113, 60068, 199524, 202623, 30148}
+CLOUD_ASNS = {16509, 14618, 8987, 15169, 396982, 19527, 8075, 31898, 14061, 24940, 16276, 20473, 63949, 45102, 132203, 906}
+SHARED_NETS = [ipaddress.ip_network(n) for n in ("35.185.44.232/32", "23.185.0.0/24", "185.199.108.0/22", "75.2.60.5/32", "99.83.190.102/32")]
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+def http_json(url, timeout=15, headers=None):
+    req = urllib.request.Request(url, headers={"User-Agent": "sing-box-daimon", **(headers or {})})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.load(resp)
+
+def validate(data):
+    if not isinstance(data, list) or len(data) < 1000:
+        raise ValueError("dataset is not a list of at least 1000 entries")
+    good = sum(1 for x in data if isinstance(x, dict) and isinstance(x.get("alpha_two_code"), str)
+               and len(x["alpha_two_code"]) == 2 and isinstance(x.get("domains"), list))
+    if good < len(data) * 0.95:
+        raise ValueError(f"only {good}/{len(data)} entries have alpha_two_code and domains")
+    return data
+
+def load_dataset(cache, max_age_days):
+    fresh = os.path.exists(cache) and time.time() - os.path.getmtime(cache) < max_age_days * 86400
+    if not fresh:
+        try:
+            data = validate(http_json(DATASET_URL, timeout=90))
+            tmp = cache + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, cache)
+            return data
+        except Exception as exc:
+            if not os.path.exists(cache):
+                raise SystemExit(f"dataset download failed: {exc}")
+            log(f"dataset download failed ({exc}), using cached copy")
+    with open(cache, encoding="utf-8") as f:
+        return validate(json.load(f))
+
+def candidates(data, country):
+    out = []
+    for uni in data:
+        if str(uni.get("alpha_two_code", "")).upper() != country:
+            continue
+        for dom in (uni.get("domains") or [])[:2]:
+            dom = str(dom).strip().lower().rstrip(".")
+            if not DOMAIN_RE.match(dom):
+                continue
+            out += [dom] if dom.startswith("www.") else ["www." + dom, dom]
+    return list(dict.fromkeys(out))
+
+def tcp_probe(host, timeout=2.5):
+    try:
+        addrs = socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)
+    except OSError:
+        return None
+    ip = addrs[0][4][0]
+    start = time.time()
+    try:
+        socket.create_connection((ip, 443), timeout=timeout).close()
+    except OSError:
+        return None
+    return host, ip, (time.time() - start) * 1000
+
+def in_shared_net(ip):
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(addr in net for net in SHARED_NETS)
+
+def doh_cname(host):
+    for url, hdr in (("https://dns.google/resolve?type=CNAME&name=" + host, None),
+                     ("https://cloudflare-dns.com/dns-query?type=CNAME&name=" + host, {"accept": "application/dns-json"})):
+        try:
+            data = http_json(url, timeout=8, headers=hdr)
+            return " ".join(a.get("data", "") for a in data.get("Answer", []) if a.get("type") == 5)
+        except Exception:
+            continue
+    return ""
+
+ASN_CACHE, ASN_LOCK = {}, threading.Lock()
+
+def asn_of(ip):
+    try:
+        net = http_json("https://stat.ripe.net/data/network-info/data.json?resource=" + ip)["data"]
+        asn = int(net["asns"][0])
+    except Exception:
+        return 0, ""
+    with ASN_LOCK:
+        if asn in ASN_CACHE:
+            return asn, ASN_CACHE[asn]
+    try:
+        holder = http_json("https://stat.ripe.net/data/as-overview/data.json?resource=AS%d" % asn)["data"]["holder"] or ""
+    except Exception:
+        holder = ""
+    holder = re.sub(r"\s+", " ", holder)[:40]
+    with ASN_LOCK:
+        ASN_CACHE[asn] = holder
+    return asn, holder
+
+def tls_ok(host):
+    try:
+        out = subprocess.run(["timeout", "10", "openssl", "s_client", "-connect", host + ":443", "-servername", host,
+                              "-tls1_3", "-groups", "X25519", "-alpn", "h2", "-verify_hostname", host],
+                             input="", capture_output=True, text=True, timeout=15).stdout
+    except Exception:
+        return False
+    return "TLSv1.3" in out and "ALPN protocol: h2" in out and "Verify return code: 0 (ok)" in out
+
+def http_check(host):
+    try:
+        out = subprocess.run(["curl", "-sS", "-m", "12", "-o", "/dev/null", "-D", "-", "-w", "\n__META__ %{http_code} %{time_appconnect}",
+                              "https://" + host + "/"], capture_output=True, text=True, timeout=20).stdout
+    except Exception:
+        return None
+    if "__META__" not in out:
+        return None
+    headers, meta = out.rsplit("__META__", 1)
+    code, appconnect = meta.split()[:2]
+    return code, float(appconnect) * 1000, headers
+
+def classify_headers(headers):
+    return bool(CDN_HEADER.search(headers.replace("\r", "")))
+
+def shared_ips(reach):
+    sites = {}
+    for host, ip, _ in reach:
+        sites.setdefault(ip, set()).add(host[4:] if host.startswith("www.") else host)
+    return {ip for ip, names in sites.items() if len(names) > 1}
+
+def full_check(item, vps_asn, shared=frozenset()):
+    host, ip, tcp_ms = item
+    if in_shared_net(ip):
+        return None
+    if CDN_CNAME.search(doh_cname(host)):
+        return None
+    if not tls_ok(host):
+        return None
+    res = http_check(host)
+    if not res or res[0] != "200" or classify_headers(res[2]):
+        return None
+    asn, holder = asn_of(ip)
+    if asn in CDN_ASNS:
+        return None
+    flags = []
+    if vps_asn and asn == vps_asn:
+        flags.append("同ASN")
+    if asn in CLOUD_ASNS:
+        flags.append("云托管")
+    if ip in shared:
+        flags.append("共享主机")
+    return {"host": host, "ip": ip, "tcp": tcp_ms, "tls": res[1], "asn": asn, "holder": holder, "flags": ",".join(flags)}
+
+def rank(results, top):
+    out, seen = [], set()
+    for r in sorted((r for r in results if r), key=lambda r: (r["tls"], r["tcp"])):
+        if r.get("ip") in seen:
+            continue
+        seen.add(r.get("ip"))
+        out.append(r)
+    return out[:top]
+
+def selftest():
+    sample = [{"alpha_two_code": "JP", "domains": ["u-tokyo.ac.jp", "www.kyoto-u.ac.jp", "x.ac.jp"]},
+              {"alpha_two_code": "jp", "domains": ["bad_domain", "b.ac.jp", "c.ac.jp"]},
+              {"alpha_two_code": "JP", "domains": ["U-Tokyo.ac.jp."]},
+              {"alpha_two_code": "US", "domains": ["mit.edu"]}] + [{"alpha_two_code": "XX", "domains": []}] * 1000
+    validate(sample)
+    for bad in ([], [{"alpha_two_code": "JP"}] * 1200, {"x": 1}):
+        try:
+            validate(bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError("invalid dataset accepted")
+    assert candidates(sample, "JP") == ["www.u-tokyo.ac.jp", "u-tokyo.ac.jp", "www.kyoto-u.ac.jp", "www.b.ac.jp", "b.ac.jp"], candidates(sample, "JP")
+    assert candidates(sample, "US") == ["www.mit.edu", "mit.edu"]
+    assert classify_headers("HTTP/2 200\r\ncf-ray: 1-SIN\r\n")
+    assert classify_headers("HTTP/2 200\r\nvia: 1.1 varnish\r\n")
+    assert classify_headers("HTTP/2 200\r\nx-pantheon-styx-hostname: a\r\n")
+    assert not classify_headers("HTTP/2 200\r\nserver: nginx\r\ncontent-type: text/html\r\n")
+    assert CDN_CNAME.search("e1.a.akamaiedge.net. www.x.edu.cdn.cloudflare.net.") and CDN_CNAME.search("nersc.gitlab.io.")
+    assert not CDN_CNAME.search("web.cs.jhu.edu.")
+    assert in_shared_net("35.185.44.232") and in_shared_net("23.185.0.4") and not in_shared_net("128.8.127.4")
+    r = rank([{"tls": 50.0, "tcp": 3.0, "host": "b", "ip": "2"}, None, {"tls": 20.0, "tcp": 9.0, "host": "a", "ip": "1"},
+              {"tls": 30.0, "tcp": 1.0, "host": "www.a", "ip": "1"}], 10)
+    assert [x["host"] for x in r] == ["a", "b"], r
+    assert shared_ips([("www.x.jp", "1", 1), ("x.jp", "1", 1), ("www.y.jp", "2", 1), ("z.jp", "2", 1)]) == {"2"}
+    print("REALITY_FINDER_SELFTEST=PASS")
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--country")
+    ap.add_argument("--cache", default="/tmp/universities.json")
+    ap.add_argument("--max-age", type=float, default=7)
+    ap.add_argument("--keep", type=int, default=100)
+    ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("--vps-ip", default="")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--validate")
+    a = ap.parse_args()
+    if a.selftest:
+        return selftest()
+    if a.validate:
+        with open(a.validate, encoding="utf-8") as f:
+            data = validate(json.load(f))
+        print(len(data))
+        return
+    country = (a.country or "").upper()
+    if not re.fullmatch(r"[A-Z]{2}", country):
+        raise SystemExit("country must be a two-letter code")
+    data = load_dataset(a.cache, a.max_age)
+    cands = candidates(data, country)
+    log(f"{country}: {len(cands)} candidate domains")
+    if not cands:
+        return
+    with cf.ThreadPoolExecutor(64) as ex:
+        reach = sorted((r for r in ex.map(tcp_probe, cands) if r), key=lambda r: r[2])[:a.keep]
+    log(f"{len(reach)} reachable on 443, checking the nearest")
+    vps_asn = asn_of(a.vps_ip)[0] if a.vps_ip else 0
+    shared = shared_ips(reach)
+    with cf.ThreadPoolExecutor(16) as ex:
+        results = list(ex.map(lambda item: full_check(item, vps_asn, shared), reach))
+    for r in rank(results, a.top):
+        print("\t".join([r["host"], r["ip"], "%.1f" % r["tcp"], "%.1f" % r["tls"], str(r["asn"]), r["holder"], r["flags"]]))
+
+main()
+PY
+}
+
+detect_country_code() {
+  local cc
+  cc="$(curl -fsS --max-time 6 https://ipinfo.io/country 2>/dev/null | tr -dc 'A-Za-z' | head -c 2)"
+  [[ "$cc" =~ ^[A-Za-z]{2}$ ]] || cc="$(curl -fsS --max-time 6 'http://ip-api.com/line/?fields=countryCode' 2>/dev/null | tr -dc 'A-Za-z' | head -c 2)"
+  [[ "$cc" =~ ^[A-Za-z]{2}$ ]] && printf '%s' "${cc^^}"
+}
+
+reality_scan_available() {
+  ! is_alpine && ! lite_mode && has_cmd python3 && has_cmd openssl && has_cmd curl
+}
+
+# Runs the finder and lets the user pick a site. Prompts and the result table go
+# to stderr; the chosen domain is the only thing printed on stdout.
+pick_scanned_reality_sni() {
+  local cc input out choice line d ip tcp tls asn holder flags i=0
+  local -a rows=()
+  printf '从公开高校域名数据集取所在国家的网站，在本机检测 TLS1.3 + h2 + X25519、证书有效、200 无跳转、非 CDN/共享托管，按本机握手延迟排序。\n' >&2
+  cc="$(detect_country_code || true)"
+  safe_read "国家/地区代码（ISO 两位字母）[${cc:-US}]，0 返回: " input || return 1
+  [[ "$input" != 0 ]] || { menu_cancel; return 1; }
+  input="${input:-${cc:-US}}"
+  input="${input^^}"
+  [[ "$input" =~ ^[A-Z]{2}$ ]] || { warn "国家代码格式错误。" >&2; return 1; }
+  mkdir -p "$ROOT/cache" || return 1
+  info "正在检测 $input 的候选网站，通常需要 15-60 秒..." >&2
+  out="$(reality_finder --country "$input" --cache "$ROOT/cache/universities.json" --vps-ip "$(public_ipv4 2>/dev/null || true)")" || { fail "查找失败：数据集下载或检测出错。" >&2; return 1; }
+  mapfile -t rows < <(printf '%s\n' "$out" | sed '/^$/d')
+  ((${#rows[@]})) || { warn "没有找到符合条件的网站，可换一个国家代码，或手动输入。" >&2; return 1; }
+  printf '\n%-4s %-36s %9s %9s  %s\n' "#" "域名" "TCP" "TLS" "ASN / 备注" >&2
+  for line in "${rows[@]}"; do
+    IFS=$'\t' read -r d ip tcp tls asn holder flags <<<"$line"
+    i=$((i + 1))
+    printf '%-4s %-36s %7sms %7sms  AS%s %s%s\n' "$i." "$d" "$tcp" "$tls" "$asn" "$holder" "${flags:+  [$flags]}" >&2
+  done
+  printf '同ASN = 与本机同一 ASN；云托管 = 托管在云厂商；共享主机 = 同一 IP 上有多个不同网站。后两种请自行确认不是多租户共享入口。\n' >&2
+  choice="$(ask_menu "选择网站（0 返回）: " "${#rows[@]}")"
+  [[ "$choice" != 0 ]] || { menu_cancel; return 1; }
+  cut -f1 <<<"${rows[choice-1]}"
+}
+
+# Used when adding Vless-reality (manual or one-click). Prints "sni<TAB>target";
+# target stays empty (= SNI:443) unless a custom one is entered.
+choose_reality_sni() {
+  local choice sni target scan=false
+  reality_scan_available && scan=true
+  printf 'Vless-reality SNI：\n1. 随机（%s）\n' "${SNI_OPTIONS[*]}" >&2
+  [[ "$scan" == true ]] && printf '2. 扫描本机所在地区的高校网站（约 15-60 秒）\n' >&2
+  printf '3. 自定义 SNI 和 target\n0. 返回\n' >&2
+  while true; do
+    choice="$(ask_menu "请选择 [回车=1]: " 3 1)"
+    [[ "$choice" == 2 && "$scan" == false ]] || break
+    warn "当前环境不支持扫描（需要标准安装和 Python3）。" >&2
+  done
+  case "$choice" in
+    1) printf '%s\t' "$(random_sni)" ;;
+    2) sni="$(pick_scanned_reality_sni)" || return 1; printf '%s\t' "$sni" ;;
+    3)
+      while true; do
+        safe_read "请输入 SNI 域名: " sni || return 1
+        valid_domain "$sni" && break
+        warn "SNI 请输入有效域名。" >&2
+      done
+      target="$(ask_reality_target "$sni")" || return 1
+      confirm_reality_target "$sni" "$target" || return 1
+      printf '%s\t%s' "$sni" "$(reality_target_state_value "$sni" "$target")"
+      ;;
+    *) menu_cancel; return 1 ;;
+  esac
+}
+
+find_reality_target_menu() {
+  require_core_installed || return 1
+  reality_scan_available || { fail "查找 REALITY 目标需要标准安装（Python3、OpenSSL、curl）。"; return 1; }
+  title "查找 REALITY 目标网站"
+  protocol_exists vless_reality || { warn "尚未添加 Vless-reality；添加协议时也可以直接选择扫描。"; return 1; }
+  local domain
+  domain="$(pick_scanned_reality_sni)" || return 1
+  ask_yes_no "将 Vless-reality 的 SNI 和 target 改为 $domain / $domain:443？" y || return 1
+  apply_state_change config set_protocol vless_reality "sni=$domain" "target=" || return 1
+  restart_if_running || return 1
+  info "已更新，客户端需要更新订阅或重新导入节点。"
+  show_protocol_details vless_reality
+}
+
 main_menu_item_hidden() {
   case "$1" in
     3) is_alpine ;;
-    7) is_alpine || lite_mode ;;
+    7|16) is_alpine || lite_mode ;;
     14) ! has_cmd ufw ;;
     *) return 1 ;;
   esac
@@ -4922,9 +5327,10 @@ main_menu() {
     fi
     has_cmd ufw && menu_line 14 "一键放行所有缺失端口"
     menu_line 15 "设置节点名称前缀"
+    is_alpine || lite_mode || menu_line 16 "查找 REALITY 目标网站（同地区高校站点）"
     local choice
     while true; do
-      choice="$(ask_menu "请选择: " 15)"
+      choice="$(ask_menu "请选择: " 16)"
       main_menu_item_hidden "$choice" || break
       warn "请选择当前菜单显示的编号。"
     done
@@ -4945,6 +5351,7 @@ main_menu() {
       13) change_subscription_config || true; menu_pause ;;
       14) allow_missing_ufw_ports || true; menu_pause ;;
       15) node_prefix_menu || true; menu_pause ;;
+      16) find_reality_target_menu || true; menu_pause ;;
       0) exit 0 ;;
     esac
   done

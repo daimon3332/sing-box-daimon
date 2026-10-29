@@ -92,9 +92,12 @@ show_protocol_details() { :; }
 PUBLIC_IPS_DETECTED=false
 PUBLIC_IPS_CHECKED=0
 SAFE_READ_COUNT=0
-INPUTS=(n ph2.1card.cc)
+# Prefix, address, then Enter at the Reality SNI prompt keeps a random built-in SNI.
+# The SNI prompt reads inside $(...), so the parent counter only sees the first two.
+INPUTS=(n ph2.1card.cc "")
 add_all_protocols >/dev/null
 [[ "$SAFE_READ_COUNT" == "2" ]]
+[[ " ${SNI_OPTIONS[*]} " == *" $(proto_value vless_reality sni) "* ]]
 for proto in mixed vless_reality vmess_ws hysteria2 tuic anytls; do
   [[ "$(proto_value "$proto" endpoint_host "")" == "ph2.1card.cc" ]]
   [[ "$(proto_value "$proto" ip_version "")" == "custom" ]]

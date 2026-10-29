@@ -41,6 +41,7 @@ NAT 模式会先检查必需命令，依赖齐全时完全跳过包管理器。�
 - 同一菜单的 HTTP/IP 订阅下载地址与节点连接地址相互独立。Alpine/NAT 模式不提供 HTTP/HTTPS 订阅，但保留节点地址管理。
 - 菜单 `11. 一键更换协议端口`：可选全部协议或多选指定协议，随机生成 20000–60000 的新端口，自动避开已占用端口、其他协议端口、Hysteria-2 跳跃范围和历史端口；确认前列出“旧端口 -> 新端口”，所有选中协议在同一次变更中生效，同时更新 UFW 规则、跳跃端口转发和订阅。需要指定端口请用菜单 `9` 修改协议。
 - 更换过的旧端口记录在 `/etc/sing-box/port-history`（最近 200 条），可在菜单 `11` 中查看；菜单 `9` 手动改端口时旧端口同样记入历史，填写历史端口会给出提示。NAT 模式更换后需在服务商面板更新端口映射。
+- 菜单 `16. 查找 REALITY 目标网站`（仅标准模式）：从公开的 [Hipo university-domains-list](https://github.com/Hipo/university-domains-list)（MIT 协议，本地缓存 7 天）中取本机所在国家的高校网站。先在本机测 443 端口的 TCP 延迟，取最近的 100 个，再逐个检测 TLS1.3、h2、X25519、证书有效、HTTP 200 无跳转、不在 CDN/共享托管上（检查 CNAME、响应头和 ASN），最后按本机测得的 TLS 握手延迟排序，列出前 10 个，并标注 ASN、同 ASN、云托管、共享主机。选中后会把 Vless-reality 的 SNI 和 target 改为该网站。检测时会访问 GitHub、dns.google、cloudflare-dns.com 和 RIPEstat。
 - `0` 返回上级菜单；输入结束（Ctrl-D）取消当前输入，不自动接受修改。节点变更先生成并检查配置，生成或校验失败时不发布。
 
 手动彻底删除脚本、sing-box、节点、订阅服务、脚本托管的 UFW 规则和跳跃端口转发：
@@ -355,7 +356,8 @@ http://IP:2096/sub/token/mihomo
 - Mixed/SOCKS5 默认随机生成端口、用户名和密码，不同服务器之间不共用；其余协议同样默认随机使用高位端口
 - SOCKS5 是明文协议，容易被主动探测识别，不建议长期暴露在公网
 - SOCKS5 分享链接使用明文 `用户名:密码`
-- Reality SNI 随机使用 `www.bing.com`、`www.amazon.com`、`www.apple.com`，并支持自定义
+- 手动添加 Vless-reality 和一键添加协议时，SNI 有三种选法：`1` 随机使用 `www.bing.com`、`www.amazon.com`、`www.apple.com`（直接回车）；`2` 扫描本机所在地区的高校网站并从结果中选择（仅标准模式，同菜单 16）；`3` 自定义 SNI 和 target。修改协议时也可以单独修改 SNI 和 target
+- Reality target（握手目标 `域名:端口` 或 `[IPv6]:端口`）可以单独设置，留空时等于 `SNI:443`；保存前会检测 target 是否支持 TLS1.3 + h2 + X25519，不支持时需要确认才会保存
 - Hysteria2 支持 UDP 跳跃端口转发；TUIC 不再提供半实现跳跃端口入口
 - 跳跃端口规则在每次启动 sing-box 前按 `state.json` 自动重建，重启 VPS 后无需安装 iptables-persistent
 - Hysteria2/TUIC 默认使用自签证书，客户端订阅默认跳过证书验证
